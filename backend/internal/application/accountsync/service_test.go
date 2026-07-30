@@ -34,6 +34,17 @@ type accountReaderStub struct {
 	quota    provider.QuotaKind
 }
 
+type identityAccountReaderStub struct {
+	accountReaderStub
+	err   error
+	calls int
+}
+
+func (s *identityAccountReaderStub) SyncAccountIdentity(context.Context, uint64) error {
+	s.calls++
+	return s.err
+}
+
 func (s accountReaderStub) Get(context.Context, uint64) (accountapp.View, error) {
 	return accountapp.View{Credential: accountdomain.Credential{Provider: s.provider}}, nil
 }
@@ -147,6 +158,44 @@ func TestSyncAccountFetchesOnlyMissingSnapshots(t *testing.T) {
 	}
 }
 
+func TestSyncAccountRecomputesModelsAfterCreatingBillingSnapshot(t *testing.T) {
+	billing := &billingStub{}
+	models := &modelStub{hasSnapshot: true}
+	service := NewService(slog.Default(), accountReaderStub{provider: accountdomain.ProviderBuild}, billing, nil, models)
+
+	if err := service.syncAccount(context.Background(), 8); err != nil {
+		t.Fatal(err)
+	}
+
+	_, billingSyncs := billing.counts()
+	_, modelSyncs := models.counts()
+	if billingSyncs != 1 || modelSyncs != 1 {
+		t.Fatalf("billing syncs = %d, model syncs = %d", billingSyncs, modelSyncs)
+	}
+}
+
+func TestSyncModelsAlwaysRefreshesExistingCapabilitySnapshot(t *testing.T) {
+	models := &modelStub{hasSnapshot: true}
+	service := NewService(slog.Default(), accountReaderStub{provider: accountdomain.ProviderBuild}, &billingStub{}, nil, models)
+
+	if err := service.SyncModels(context.Background(), 8); err != nil {
+		t.Fatal(err)
+	}
+	checks, syncs := models.counts()
+	if checks != 0 || syncs != 1 {
+		t.Fatalf("model checks/syncs = %d/%d", checks, syncs)
+	}
+}
+
+func TestSyncModelsPropagatesRefreshFailure(t *testing.T) {
+	models := &modelStub{syncErr: errors.New("upstream unavailable")}
+	service := NewService(slog.Default(), accountReaderStub{provider: accountdomain.ProviderBuild}, &billingStub{}, nil, models)
+
+	if err := service.SyncModels(context.Background(), 9); err == nil {
+		t.Fatal("expected model sync error")
+	}
+}
+
 func TestSyncAccountUsesQuotaForConsoleProvider(t *testing.T) {
 	billing := &billingStub{}
 	quota := &quotaStub{}
@@ -160,6 +209,42 @@ func TestSyncAccountUsesQuotaForConsoleProvider(t *testing.T) {
 	billingChecks, billingSyncs := billing.counts()
 	if billingChecks != 0 || billingSyncs != 0 || quota.checks != 1 || quota.syncs != 1 {
 		t.Fatalf("billing = %d/%d, quota = %d/%d", billingChecks, billingSyncs, quota.checks, quota.syncs)
+	}
+}
+
+func TestSyncAccountIgnoresBestEffortSSOIdentityFailure(t *testing.T) {
+	for _, providerValue := range []accountdomain.Provider{accountdomain.ProviderWeb, accountdomain.ProviderConsole} {
+		t.Run(string(providerValue), func(t *testing.T) {
+			reader := &identityAccountReaderStub{accountReaderStub: accountReaderStub{provider: providerValue}, err: errors.New("session unavailable")}
+			quota := &quotaStub{}
+			models := &modelStub{hasSnapshot: true}
+			service := NewService(slog.Default(), reader, &billingStub{}, quota, models)
+
+			if err := service.syncAccount(context.Background(), 10); err != nil {
+				t.Fatal(err)
+			}
+			if reader.calls != 1 || quota.syncs != 1 {
+				t.Fatalf("identity calls=%d quota syncs=%d", reader.calls, quota.syncs)
+			}
+		})
+	}
+}
+
+func TestSyncAccountStopsAfterSSOIdentityUnauthorized(t *testing.T) {
+	for _, providerValue := range []accountdomain.Provider{accountdomain.ProviderWeb, accountdomain.ProviderConsole} {
+		t.Run(string(providerValue), func(t *testing.T) {
+			reader := &identityAccountReaderStub{accountReaderStub: accountReaderStub{provider: providerValue}, err: provider.ErrUnauthorized}
+			quota := &quotaStub{}
+			models := &modelStub{hasSnapshot: true}
+			service := NewService(slog.Default(), reader, &billingStub{}, quota, models)
+
+			if err := service.syncAccount(context.Background(), 10); !errors.Is(err, provider.ErrUnauthorized) {
+				t.Fatalf("err = %v", err)
+			}
+			if reader.calls != 1 || quota.syncs != 0 {
+				t.Fatalf("identity calls=%d quota syncs=%d", reader.calls, quota.syncs)
+			}
+		})
 	}
 }
 

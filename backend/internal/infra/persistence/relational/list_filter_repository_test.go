@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
@@ -40,7 +41,10 @@ func TestListFilters(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := database.db.WithContext(ctx).Create(&billingModel{AccountID: paid.ID, MonthlyLimit: 100, Used: 10, SyncedAt: now}).Error; err != nil {
+	if err := database.db.WithContext(ctx).Create(&billingModel{AccountID: paid.ID, PlanName: "SuperGrokPro", IsUnifiedBillingUser: true, UsagePeriodType: "USAGE_PERIOD_TYPE_WEEKLY", SyncedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Create(&billingModel{AccountID: disabled.ID, CreditUsagePercent: 42.5, IsUnifiedBillingUser: true, UsagePeriodType: "USAGE_PERIOD_TYPE_WEEKLY", SyncedAt: now}).Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -50,8 +54,37 @@ func TestListFilters(t *testing.T) {
 	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{QuotaType: "unknown", Now: now}, 1)
 	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Status: "active", Now: now}, 2)
 	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Status: "disabled", Now: now}, 1)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{AccountIDs: []uint64{free.ID}, RestrictIDs: true, Now: now}, 1)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{RestrictIDs: true, Now: now}, 0)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{ExcludeIDs: []uint64{free.ID}, Now: now}, 2)
 	refreshable := true
 	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Refreshable: &refreshable, Now: now}, 1)
+	boundNode := egressNodeModel{Name: "bound-filter", Scope: "grok_build", Enabled: true}
+	if err := database.db.WithContext(ctx).Create(&boundNode).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Model(&accountModel{}).Where("id = ?", free.ID).Update("egress_node_id", boundNode.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Egress: "bound", Now: now}, 1)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Egress: "unbound", Now: now}, 2)
+
+	// 零 Billing + build_super_entitled：paid 可查到，free 查不到。
+	entitled := accountModel{IdentityKey: testIdentityKey("entitled-zero"), Provider: "grok_build", Name: "entitled-zero", SourceKey: "entitled-zero", ObservedModel: "grok-build-free", Enabled: true, AuthStatus: "active", Priority: 1, BuildSuperEntitled: true}
+	if err := database.db.WithContext(ctx).Create(&entitled).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Create(&accountCredentialModel{AccountID: entitled.ID, AuthType: "oauth", EncryptedPrimary: testEncryptedToken, UpdatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Create(&billingModel{AccountID: entitled.ID, IsUnifiedBillingUser: true, SyncedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{QuotaType: "paid", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{QuotaType: "free", Now: now}, 1)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Status: "active", Now: now}, 3)
+
+	var webByTier = map[string]accountModel{}
 	for _, tier := range []string{"auto", "basic", "super", "heavy"} {
 		value := accountModel{IdentityKey: testIdentityKey("web-" + tier), Provider: "grok_web", Name: "web-" + tier, SourceKey: "web-" + tier, Enabled: true, AuthStatus: "active", Priority: 1}
 		if err := database.db.WithContext(ctx).Create(&value).Error; err != nil {
@@ -60,10 +93,93 @@ func TestListFilters(t *testing.T) {
 		if err := database.db.WithContext(ctx).Create(&webAccountProfileModel{AccountID: value.ID, Tier: tier, SyncedAt: &now}).Error; err != nil {
 			t.Fatal(err)
 		}
+		webByTier[tier] = value
 		assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", QuotaType: tier, Now: now}, 1)
 	}
+	// Web agreement and association filters cover NSFW, terms, Build, and Console.
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Agreement: "nsfwDisabled", Now: now}, 4)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Agreement: "termsNotAccepted", Now: now}, 4)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Agreement: "allNotAccepted", Now: now}, 4)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Association: "allUnlinked", Now: now}, 4)
+
+	nsfwWeb := webByTier["auto"]
+	termsWeb := webByTier["basic"]
+	bothAgreedWeb := webByTier["super"]
+	if err := database.db.WithContext(ctx).Model(&webAccountProfileModel{}).Where("account_id = ?", nsfwWeb.ID).Updates(map[string]any{"nsfw_enabled_at": now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Model(&webAccountProfileModel{}).Where("account_id = ?", termsWeb.ID).Updates(map[string]any{
+		"terms_accepted_at": now, "terms_accepted_version": account.CurrentWebTermsVersion,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Model(&webAccountProfileModel{}).Where("account_id = ?", bothAgreedWeb.ID).Updates(map[string]any{
+		"nsfw_enabled_at": now, "terms_accepted_at": now, "terms_accepted_version": account.CurrentWebTermsVersion,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// An outdated terms version must not count as accepted.
+	staleTermsWeb := webByTier["heavy"]
+	if err := database.db.WithContext(ctx).Model(&webAccountProfileModel{}).Where("account_id = ?", staleTermsWeb.ID).Updates(map[string]any{
+		"terms_accepted_at": now, "terms_accepted_version": account.CurrentWebTermsVersion - 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Agreement: "nsfwEnabled", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Agreement: "nsfwDisabled", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Agreement: "termsAccepted", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Agreement: "termsNotAccepted", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Agreement: "allAccepted", Now: now}, 1)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Agreement: "allNotAccepted", Now: now}, 1)
+
+	buildAccount := accountModel{IdentityKey: testIdentityKey("link-build"), Provider: "grok_build", Name: "link-build", SourceKey: "link-build", Enabled: true, AuthStatus: "active", Priority: 1}
+	consoleAccount := accountModel{IdentityKey: testIdentityKey("link-console"), Provider: "grok_console", Name: "link-console", SourceKey: "link-console", Enabled: true, AuthStatus: "active", Priority: 1}
+	for _, value := range []*accountModel{&buildAccount, &consoleAccount} {
+		if err := database.db.WithContext(ctx).Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := database.db.WithContext(ctx).Create(&accountProviderLinkModel{WebAccountID: nsfwWeb.ID, BuildAccountID: buildAccount.ID, CreatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Create(&webConsoleAccountLinkModel{WebAccountID: termsWeb.ID, ConsoleAccountID: consoleAccount.ID, CreatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	bothLinkedBuild := accountModel{IdentityKey: testIdentityKey("both-build"), Provider: "grok_build", Name: "both-build", SourceKey: "both-build", Enabled: true, AuthStatus: "active", Priority: 1}
+	bothLinkedConsole := accountModel{IdentityKey: testIdentityKey("both-console"), Provider: "grok_console", Name: "both-console", SourceKey: "both-console", Enabled: true, AuthStatus: "active", Priority: 1}
+	for _, value := range []*accountModel{&bothLinkedBuild, &bothLinkedConsole} {
+		if err := database.db.WithContext(ctx).Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := database.db.WithContext(ctx).Create(&accountProviderLinkModel{WebAccountID: bothAgreedWeb.ID, BuildAccountID: bothLinkedBuild.ID, CreatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Create(&webConsoleAccountLinkModel{WebAccountID: bothAgreedWeb.ID, ConsoleAccountID: bothLinkedConsole.ID, CreatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Association: "buildLinked", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Association: "buildUnlinked", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Association: "consoleLinked", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Association: "consoleUnlinked", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Association: "allLinked", Now: now}, 1)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_web", Association: "allUnlinked", Now: now}, 1)
+	// Seed an orphan Console account so the Build/Console Web-link filters have an unlinked result.
+	orphanConsole := accountModel{IdentityKey: testIdentityKey("orphan-console"), Provider: "grok_console", Name: "orphan-console", SourceKey: "orphan-console", Enabled: true, AuthStatus: "active", Priority: 1}
+	if err := database.db.WithContext(ctx).Create(&orphanConsole).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Four Build accounts are unlinked; link-build and both-build are linked.
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_build", Association: "webLinked", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_build", Association: "webUnlinked", Now: now}, 4)
+	// link-console and both-console are linked; orphan-console is unlinked.
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_console", Association: "webLinked", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_console", Association: "webUnlinked", Now: now}, 1)
+	// Combine association and state filters: the disabled Build account is unlinked and both linked accounts are active.
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_build", Association: "webLinked", Status: "active", Now: now}, 2)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{Provider: "grok_build", Association: "webUnlinked", Status: "disabled", Now: now}, 1)
 	accountValues, _, err := accounts.List(ctx, repository.AccountListQuery{Page: repository.PageQuery{Limit: 20, Sort: repository.SortQuery{Field: "name", Direction: repository.SortAscending}}, Filter: repository.AccountListFilter{Provider: "grok_build", Now: now}})
-	if err != nil || len(accountValues) != 3 || accountValues[0].Name != "disabled" || accountValues[2].Name != "paid" {
+	if err != nil || len(accountValues) < 4 || accountValues[0].Name != "both-build" || accountValues[len(accountValues)-1].Name != "paid" {
 		t.Fatalf("account name sort = %#v, err = %v", accountValues, err)
 	}
 
@@ -151,6 +267,32 @@ func TestListFilters(t *testing.T) {
 	if err != nil || hasMore || len(secondAuditPage) != 1 || secondAuditPage[0].RequestID != "success" {
 		t.Fatalf("audit status second page = %#v, hasMore = %v, err = %v", secondAuditPage, hasMore, err)
 	}
+}
+
+func TestListFiltersRecognizesInferredFreeBilling(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "inferred-free.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	value := accountModel{IdentityKey: testIdentityKey("inferred-free"), Provider: "grok_build", Name: "inferred-free", SourceKey: "inferred-free", Enabled: true, AuthStatus: "active", Priority: 1}
+	if err := database.db.WithContext(ctx).Create(&value).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Create(&billingModel{
+		AccountID: value.ID, IsUnifiedBillingUser: true, UsagePeriodType: "USAGE_PERIOD_TYPE_WEEKLY", SyncedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	accounts := NewAccountRepository(database)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{QuotaType: "free", Now: now}, 1)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{QuotaType: "paid", Now: now}, 0)
+	assertAccountFilterCount(t, ctx, accounts, repository.AccountListFilter{QuotaType: "unknown", Now: now}, 0)
 }
 
 func assertAccountFilterCount(t *testing.T, ctx context.Context, accounts *AccountRepository, filter repository.AccountListFilter, expected int64) {

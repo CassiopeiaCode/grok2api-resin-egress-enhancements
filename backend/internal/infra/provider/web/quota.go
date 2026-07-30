@@ -150,7 +150,7 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 		request.Header = buildHeaders(token, lease, "application/json")
 		applyAppHeaders(request.Header, cfg.BaseURL, cfg.BaseURL+"/")
 		a.applySignedStatsig(requestCtx, request, token, lease)
-		response, err = lease.Do(request)
+		response, err = lease.DoDeferredForbidden(request)
 		if err != nil {
 			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
 			return account.QuotaWindow{}, err
@@ -161,6 +161,11 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 			return account.QuotaWindow{}, err
 		}
 		if response.StatusCode == http.StatusForbidden {
+			// Preserve definitive account-block signals before a Statsig retry can discard the first response.
+			if provider.IsDefinitiveAccountBlockBody(body) {
+				return account.QuotaWindow{}, fmt.Errorf("%w: account blocked", provider.ErrUnauthorized)
+			}
+			lease.InvalidateClearance()
 			if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, endpoint) {
 				continue
 			}
@@ -168,10 +173,13 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 		break
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
 		if response.StatusCode == http.StatusUnauthorized {
 			return account.QuotaWindow{}, provider.ErrUnauthorized
 		}
+		if response.StatusCode == http.StatusForbidden && provider.IsDefinitiveAccountBlockBody(body) {
+			return account.QuotaWindow{}, fmt.Errorf("%w: account blocked", provider.ErrUnauthorized)
+		}
+		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
 		return account.QuotaWindow{}, fmt.Errorf("Grok Web 额度接口返回 %d", response.StatusCode)
 	}
 	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
@@ -222,7 +230,7 @@ func (a *Adapter) syncWeeklyCredits(ctx context.Context, credential account.Cred
 	request.Header.Set("x-grpc-web", "1")
 	request.Header.Set("x-user-agent", "connect-es/2.1.1")
 
-	response, err := lease.Do(request)
+	response, err := lease.DoDeferredForbidden(request)
 	if err != nil {
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
 		return account.QuotaWindow{}, err
@@ -233,10 +241,16 @@ func (a *Adapter) syncWeeklyCredits(ctx context.Context, credential account.Cred
 		return account.QuotaWindow{}, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
 		if response.StatusCode == http.StatusUnauthorized {
 			return account.QuotaWindow{}, provider.ErrUnauthorized
 		}
+		if response.StatusCode == http.StatusForbidden && provider.IsDefinitiveAccountBlockBody(body) {
+			return account.QuotaWindow{}, fmt.Errorf("%w: account blocked", provider.ErrUnauthorized)
+		}
+		if response.StatusCode == http.StatusForbidden {
+			lease.InvalidateClearance()
+		}
+		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
 		return account.QuotaWindow{}, fmt.Errorf("Grok Web 周额度接口返回 %d", response.StatusCode)
 	}
 	window, err := parseWeeklyCreditsResponse(body, credential.ID, time.Now().UTC())
@@ -307,11 +321,17 @@ func parseWeeklyCreditsResponse(body []byte, accountID uint64, syncedAt time.Tim
 			config = config[consumed:]
 		}
 	}
-	if !usagePresent || math.IsNaN(usagePercent) || math.IsInf(usagePercent, 0) || usagePercent < 0 || usagePercent > 100 {
+	if usagePresent && (math.IsNaN(usagePercent) || math.IsInf(usagePercent, 0) || usagePercent < 0 || usagePercent > 100) {
 		return account.QuotaWindow{}, fmt.Errorf("Grok Web 周额度响应缺少有效使用率")
 	}
 	if periodStart == nil || periodEnd == nil || !periodEnd.After(*periodStart) {
 		return account.QuotaWindow{}, fmt.Errorf("Grok Web 周额度响应缺少有效周期")
+	}
+	if !usagePresent && periodStart.Nanosecond() == 0 && periodEnd.Nanosecond() == 0 {
+		// Free accounts return a coarse entitlement period without a usage rate.
+		// A paid, unused weekly pool has the same rate omitted but retains its
+		// precise period boundaries, which represents zero percent used.
+		return account.QuotaWindow{}, fmt.Errorf("Grok Web 周额度响应缺少有效使用率")
 	}
 	windowSeconds := int(periodEnd.Sub(*periodStart).Seconds())
 	if windowSeconds < 24*60*60 || windowSeconds > 31*24*60*60 {
@@ -326,20 +346,37 @@ func parseWeeklyCreditsResponse(body []byte, accountID uint64, syncedAt time.Tim
 }
 
 func firstGRPCWebMessage(body []byte) ([]byte, error) {
+	message, grpcStatus, err := parseGRPCWebFrames(body)
+	if err != nil {
+		return nil, err
+	}
+	if grpcStatus != "" && grpcStatus != "0" {
+		return nil, fmt.Errorf("Grok Web 周额度 gRPC 状态为 %s", grpcStatus)
+	}
+	if message == nil {
+		return nil, fmt.Errorf("Grok Web 周额度响应缺少消息帧")
+	}
+	return message, nil
+}
+
+func parseGRPCWebFrames(body []byte) ([]byte, string, error) {
 	var message []byte
 	grpcStatus := ""
-	for len(body) >= 5 {
+	for len(body) > 0 {
+		if len(body) < 5 {
+			return nil, "", fmt.Errorf("gRPC-Web 响应包含不完整帧头")
+		}
 		flag := body[0]
 		length := int(binary.BigEndian.Uint32(body[1:5]))
 		body = body[5:]
 		if length < 0 || length > len(body) {
-			return nil, fmt.Errorf("gRPC-Web 帧长度无效")
+			return nil, "", fmt.Errorf("gRPC-Web 帧长度无效")
 		}
 		payload := body[:length]
 		body = body[length:]
 		if flag&0x80 == 0 {
 			if flag != 0 {
-				return nil, fmt.Errorf("不支持压缩的 gRPC-Web 响应")
+				return nil, "", fmt.Errorf("不支持压缩的 gRPC-Web 响应")
 			}
 			if message == nil {
 				message = append([]byte(nil), payload...)
@@ -353,13 +390,7 @@ func firstGRPCWebMessage(body []byte) ([]byte, error) {
 			}
 		}
 	}
-	if grpcStatus != "" && grpcStatus != "0" {
-		return nil, fmt.Errorf("Grok Web 周额度 gRPC 状态为 %s", grpcStatus)
-	}
-	if message == nil {
-		return nil, fmt.Errorf("Grok Web 周额度响应缺少消息帧")
-	}
-	return message, nil
+	return message, grpcStatus, nil
 }
 
 func protobufMessageField(message []byte, target protowire.Number) ([]byte, error) {

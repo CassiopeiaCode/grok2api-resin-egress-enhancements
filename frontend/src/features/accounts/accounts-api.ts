@@ -1,9 +1,11 @@
-import { ApiError, apiDownload, apiEventStream, apiRequest, type PaginatedDTO } from "@/shared/api/client";
+import { ApiError, apiDownload, apiDownloadResponse, apiEventStream, apiRequest, type PaginatedDTO } from "@/shared/api/client";
 import { createObjectDecoder, createPaginatedDecoder, createValidatedDecoder, decodeBooleanResult, decodeCountResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isRecordOf, isString } from "@/shared/api/decoder";
 import { i18n } from "@/shared/i18n";
 import type { SortOrder } from "@/shared/lib/table-sort";
 
 export type AccountProvider = "grok_build" | "grok_web" | "grok_console";
+export type BuildRouteMode = "auto" | "build" | "xai";
+export type AccountCleanupStatus = "cooldown" | "disabled" | "reauthRequired";
 
 export type BillingDTO = {
   planCode?: string;
@@ -40,10 +42,10 @@ export type BillingHistoryDTO = {
 
 export type QuotaDTO = {
   type: "free" | "paid" | "unknown";
-  source: "unknown" | "upstreamBilling" | "upstreamExhaustion" | "responseModel" | "billingProfile";
+  source: "unknown" | "upstreamBilling" | "upstreamExhaustion" | "responseModel" | "billingProfile" | "buildSuperEntitlement";
   confidence: "estimated" | "observed" | "confirmed" | "";
   status: "active" | "waitingReset" | "probing";
-  unit?: "tokens" | "credits";
+  unit?: "tokens" | "credits" | "percent";
   used: number;
   limit: number;
   remaining: number;
@@ -65,6 +67,8 @@ export type AccountDTO = {
   authType: "oauth" | "sso";
   webTier?: "auto" | "basic" | "super" | "heavy";
   webTierSyncedAt?: string;
+  nsfwEnabledAt?: string;
+  termsAcceptedAt?: string;
   name: string;
   email?: string;
   userId?: string;
@@ -74,10 +78,19 @@ export type AccountDTO = {
   expiresAt?: string;
   refreshable: boolean;
   cloudflareCookieConfigured: boolean;
+  buildSuperEntitled: boolean;
+  buildRouteMode: BuildRouteMode;
+  buildBotFlagged: boolean;
+  egressNodeId?: string;
+  egressAssignmentMode?: "manual" | "auto";
+  modelSyncFailed?: boolean;
   refreshDueAt?: string;
   lastRefreshAt?: string;
   refreshFailureCount: number;
+  lastRefreshErrorStatus?: number;
   lastRefreshErrorCode?: string;
+  lastRefreshErrorMessage?: string;
+  lastRefreshErrorResponse?: string;
   priority: number;
   maxConcurrent: number;
   minimumRemaining: number;
@@ -88,10 +101,19 @@ export type AccountDTO = {
   linkedAccountId?: string;
   linkedAccountName?: string;
   linkedProvider?: "grok_build" | "grok_web";
+  linkedAccounts?: LinkedAccountDTO[];
   createdAt: string;
   billing?: BillingDTO;
   quota: QuotaDTO;
   quotaWindows?: Array<{ mode: string; remaining: number; total: number; usagePercent: number; breakdown?: Array<{ productCode: number; usagePercent: number }>; windowSeconds: number; resetAt?: string; syncedAt?: string; source: "default" | "estimated" | "upstream" }>;
+};
+
+export type LinkedAccountDTO = {
+  id: string;
+  provider: "grok_build" | "grok_web" | "grok_console";
+  name: string;
+  email?: string;
+  userId?: string;
 };
 
 export type AccountUpdateInput = {
@@ -102,6 +124,8 @@ export type AccountUpdateInput = {
   minimumRemaining: number;
   cloudflareCookies?: string;
   clearCloudflareCookies?: boolean;
+  buildSuperEntitled?: boolean;
+  buildRouteMode?: BuildRouteMode;
 };
 
 export type AccountSummaryDTO = {
@@ -109,6 +133,7 @@ export type AccountSummaryDTO = {
   available: number;
   recovering: number;
   attention: number;
+  risk: number;
   providers: Record<AccountProvider, { total: number; available: number }>;
   recovery: { cooldown: number; waitingReset: number; probing: number };
   issues: { disabled: number; reauthRequired: number };
@@ -142,9 +167,9 @@ const billingValidator = hasShape({
   billingPeriodEnd: isOptional(isString), history: isOptional(isArrayOf(billingHistoryValidator)), syncedAt: isString,
 });
 const quotaValidator = hasShape({
-  type: isOneOf("free", "paid", "unknown"), source: isOneOf("unknown", "upstreamBilling", "upstreamExhaustion", "responseModel", "billingProfile"),
+  type: isOneOf("free", "paid", "unknown"), source: isOneOf("unknown", "upstreamBilling", "upstreamExhaustion", "responseModel", "billingProfile", "buildSuperEntitlement"),
   confidence: isOneOf("estimated", "observed", "confirmed", ""), status: isOneOf("active", "waitingReset", "probing"),
-  unit: isOptional(isOneOf("tokens", "credits")), used: isNumber, limit: isNumber, remaining: isNumber, usagePercent: isNumber,
+  unit: isOptional(isOneOf("tokens", "credits", "percent")), used: isNumber, limit: isNumber, remaining: isNumber, usagePercent: isNumber,
   limitKnown: isBoolean, windowHours: isOptional(isNumber), observed: isBoolean, confirmed: isBoolean,
   periodStart: isOptional(isString), periodEnd: isOptional(isString), exhaustedAt: isOptional(isString),
   nextProbeAt: isOptional(isString), lastConfirmedAt: isOptional(isString),
@@ -154,21 +179,23 @@ const quotaWindowValidator = hasShape({
   mode: isString, remaining: isNumber, total: isNumber, usagePercent: isNumber, breakdown: isOptional(isArrayOf(quotaBreakdownValidator)),
   windowSeconds: isNumber, resetAt: isOptional(isString), syncedAt: isOptional(isString), source: isOneOf("default", "estimated", "upstream"),
 });
+const linkedAccountValidator = hasShape({ id: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), name: isString, email: isOptional(isString), userId: isOptional(isString) });
 const accountValidator = hasShape({
   id: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), authType: isOneOf("oauth", "sso"), webTier: isOptional(isOneOf("auto", "basic", "super", "heavy")),
-  webTierSyncedAt: isOptional(isString), name: isString, email: isOptional(isString), userId: isOptional(isString), teamId: isOptional(isString),
+  webTierSyncedAt: isOptional(isString), nsfwEnabledAt: isOptional(isString), termsAcceptedAt: isOptional(isString), name: isString, email: isOptional(isString), userId: isOptional(isString), teamId: isOptional(isString),
   enabled: isBoolean, authStatus: isOneOf("active", "reauthRequired"), expiresAt: isOptional(isString), refreshable: isBoolean, cloudflareCookieConfigured: isBoolean,
-  refreshDueAt: isOptional(isString), lastRefreshAt: isOptional(isString), refreshFailureCount: isNumber,
-  lastRefreshErrorCode: isOptional(isString), priority: isNumber, maxConcurrent: isNumber, minimumRemaining: isNumber,
+  buildSuperEntitled: isBoolean, buildRouteMode: isOneOf("auto", "build", "xai"), buildBotFlagged: isBoolean, modelSyncFailed: isOptional(isBoolean), refreshDueAt: isOptional(isString), lastRefreshAt: isOptional(isString), refreshFailureCount: isNumber,
+  egressNodeId: isOptional(isString), egressAssignmentMode: isOptional(isOneOf("manual", "auto")),
+  lastRefreshErrorStatus: isOptional(isNumber), lastRefreshErrorCode: isOptional(isString), lastRefreshErrorMessage: isOptional(isString), lastRefreshErrorResponse: isOptional(isString), priority: isNumber, maxConcurrent: isNumber, minimumRemaining: isNumber,
   failureCount: isNumber, cooldownUntil: isOptional(isString), lastError: isOptional(isString), lastUsedAt: isOptional(isString),
-  linkedAccountId: isOptional(isString), linkedAccountName: isOptional(isString), linkedProvider: isOptional(isOneOf("grok_build", "grok_web")),
+  linkedAccountId: isOptional(isString), linkedAccountName: isOptional(isString), linkedProvider: isOptional(isOneOf("grok_build", "grok_web")), linkedAccounts: isOptional(isArrayOf(linkedAccountValidator)),
   createdAt: isString, billing: isOptional(billingValidator), quota: quotaValidator, quotaWindows: isOptional(isArrayOf(quotaWindowValidator)),
 });
 const decodeBilling = createValidatedDecoder<BillingDTO>("billing", billingValidator);
 const decodeAccount = createValidatedDecoder<AccountDTO>("account", accountValidator);
 const decodeAccountPage = createPaginatedDecoder<AccountDTO>(accountValidator);
 const decodeAccountSummary = createObjectDecoder<AccountSummaryDTO>("account summary", {
-  total: isNumber, available: isNumber, recovering: isNumber, attention: isNumber,
+  total: isNumber, available: isNumber, recovering: isNumber, attention: isNumber, risk: isNumber,
   providers: isRecordOf(hasShape({ total: isNumber, available: isNumber })),
   recovery: hasShape({ cooldown: isNumber, waitingReset: isNumber, probing: isNumber }),
   issues: hasShape({ disabled: isNumber, reauthRequired: isNumber }),
@@ -187,7 +214,11 @@ type ListAccountsInput = {
   search?: string;
   type?: string;
   status?: string;
+  egress?: string;
   renewal?: string;
+  risk?: string;
+  agreement?: string;
+  association?: string;
   provider: AccountProvider;
   sortBy?: string;
   sortOrder?: SortOrder;
@@ -198,7 +229,11 @@ export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<Acc
   if (input.search) query.set("search", input.search);
   if (input.type) query.set("type", input.type);
   if (input.status) query.set("status", input.status);
+  if (input.egress) query.set("egress", input.egress);
   if (input.renewal) query.set("renewal", input.renewal);
+  if (input.risk) query.set("risk", input.risk);
+  if (input.agreement) query.set("agreement", input.agreement);
+  if (input.association) query.set("association", input.association);
   if (input.sortBy && input.sortOrder) {
     query.set("sortBy", input.sortBy);
     query.set("sortOrder", input.sortOrder);
@@ -215,8 +250,49 @@ export function updateAccount(id: string, input: AccountUpdateInput): Promise<Ac
   return apiRequest(`/api/admin/v1/accounts/${id}`, { method: "PATCH", body: input }, decodeAccount);
 }
 
-export function deleteAccount(id: string): Promise<{ deleted: boolean }> {
+export type LinkedDeleteTarget = AccountProvider;
+
+export type AccountDeletionPreviewDTO = {
+  rootCount: number;
+  linkedByProvider: Partial<Record<AccountProvider, number>>;
+  total: number;
+};
+
+export type AccountDeleteResultDTO = {
+  deleted: number;
+  rootsDeleted?: number;
+  linkedDeleted?: number;
+  // Batch paths skip whole groups that still have active media jobs.
+  skipped?: number;
+  deletedByProvider?: Partial<Record<AccountProvider, number>>;
+};
+
+export function deleteAccount(id: string, input?: { provider?: AccountProvider; linkedDeleteTargets?: LinkedDeleteTarget[] }): Promise<AccountDeleteResultDTO | { deleted: boolean }> {
+  if (input?.linkedDeleteTargets?.length) {
+    return apiRequest(
+      `/api/admin/v1/accounts/${id}`,
+      { method: "DELETE", body: { provider: input.provider, linkedDeleteTargets: input.linkedDeleteTargets } },
+      createObjectDecoder("account delete", {
+        deleted: isNumber,
+        rootsDeleted: isOptional(isNumber),
+        linkedDeleted: isOptional(isNumber),
+        deletedByProvider: isOptional(isRecordOf(isNumber)),
+      }),
+    );
+  }
   return apiRequest(`/api/admin/v1/accounts/${id}`, { method: "DELETE" }, decodeBooleanResult<{ deleted: boolean }>("deleted"));
+}
+
+export function previewAccountDeletion(ids: string[], provider: AccountProvider, linkedDeleteTargets: LinkedDeleteTarget[] = []): Promise<AccountDeletionPreviewDTO> {
+  return apiRequest(
+    "/api/admin/v1/accounts/deletion-preview",
+    { method: "POST", body: { ids, provider, linkedDeleteTargets } },
+    createObjectDecoder("account deletion preview", {
+      rootCount: isNumber,
+      linkedByProvider: isRecordOf(isNumber),
+      total: isNumber,
+    }),
+  );
 }
 
 export function refreshAccountBilling(id: string): Promise<BillingDTO> {
@@ -225,6 +301,18 @@ export function refreshAccountBilling(id: string): Promise<BillingDTO> {
 
 export function refreshAccountToken(id: string): Promise<AccountDTO> {
   return apiRequest(`/api/admin/v1/accounts/${id}/refresh-token`, { method: "POST" }, decodeAccount);
+}
+
+export function acceptWebAccountTerms(id: string): Promise<{ completed: boolean }> {
+  return apiRequest(`/api/admin/v1/accounts/web/${id}/accept-terms`, { method: "POST" }, decodeBooleanResult<{ completed: boolean }>("completed"));
+}
+
+export function setWebAccountBirthDate(id: string): Promise<{ completed: boolean }> {
+  return apiRequest(`/api/admin/v1/accounts/web/${id}/birth-date`, { method: "POST" }, decodeBooleanResult<{ completed: boolean }>("completed"));
+}
+
+export function enableWebAccountNSFW(id: string): Promise<{ completed: boolean }> {
+  return apiRequest(`/api/admin/v1/accounts/web/${id}/nsfw`, { method: "POST" }, decodeBooleanResult<{ completed: boolean }>("completed"));
 }
 
 export type AccountBatchResultDTO = { succeeded: number; failed: number };
@@ -250,6 +338,16 @@ export type BuildConversionInput =
 export type WebConsoleSyncInput =
   | { all: true; ids?: never; strategy: WebConsoleSyncStrategy }
   | { all?: false; ids: string[]; strategy: WebConsoleSyncStrategy };
+
+export type WebAccountScriptActions = {
+  acceptTerms: boolean;
+  setBirthDate: boolean;
+  enableNSFW: boolean;
+};
+
+export type WebAccountScriptsInput =
+  | { all: true; ids?: never; actions: WebAccountScriptActions }
+  | { all?: false; ids: string[]; actions: WebAccountScriptActions };
 
 export type AccountTaskProgressDTO = {
   completed: number;
@@ -372,6 +470,10 @@ export function syncWebAccountsToConsole(input: WebConsoleSyncInput, onProgress?
   return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", input, ["created", "updated", "skipped", "synced", "syncFailed"], onProgress, signal);
 }
 
+export function runWebAccountScripts(input: WebAccountScriptsInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountBatchResultDTO> {
+  return runAccountTask("/api/admin/v1/accounts/web/run-scripts", input, ["succeeded", "failed"], onProgress, signal);
+}
+
 export function importAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
@@ -394,20 +496,143 @@ export function refreshAccountQuota(id: string): Promise<AccountDTO> {
   return apiRequest(`/api/admin/v1/accounts/${id}/refresh-quota`, { method: "POST" }, decodeAccount);
 }
 
-export function exportAccounts(): Promise<Blob> {
-  return apiDownload("/api/admin/v1/accounts/export");
+export type AccountExportBatch = {
+  blob: Blob;
+  count: number;
+  nextId: string;
+  snapshotMaxId: string;
+  hasMore: boolean;
+};
+
+function requiredExportHeader(headers: Headers, name: string): string {
+  const value = headers.get(name);
+  if (value === null) {
+    throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
+  }
+  return value;
+}
+
+export async function exportAccountBatch(provider: AccountProvider, limit: number, afterId: string, snapshotMaxId: string): Promise<AccountExportBatch> {
+  const query = new URLSearchParams({ provider, limit: String(limit), afterId, snapshotMaxId });
+  const result = await apiDownloadResponse(`/api/admin/v1/accounts/export?${query}`);
+  const count = Number(requiredExportHeader(result.headers, "X-Exported-Accounts"));
+  const nextId = requiredExportHeader(result.headers, "X-Export-Next-ID");
+  const nextSnapshotMaxId = requiredExportHeader(result.headers, "X-Export-Snapshot-Max-ID");
+  const hasMoreText = requiredExportHeader(result.headers, "X-Export-Has-More");
+  const validCursor = /^\d+$/.test(nextId) && /^\d+$/.test(nextSnapshotMaxId);
+  if (!Number.isSafeInteger(count) || count < 0 || !validCursor || (hasMoreText !== "true" && hasMoreText !== "false")) {
+    throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
+  }
+  const hasMore = hasMoreText === "true";
+  if (hasMore && (count === 0 || BigInt(nextId) <= BigInt(afterId) || BigInt(nextId) > BigInt(nextSnapshotMaxId))) {
+    throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
+  }
+  return {
+    blob: result.blob,
+    count,
+    nextId,
+    snapshotMaxId: nextSnapshotMaxId,
+    hasMore,
+  };
+}
+
+export function exportSelectedAccounts(provider: AccountProvider, ids: string[]): Promise<Blob> {
+  return apiDownload("/api/admin/v1/accounts/export", { method: "POST", body: { provider, ids } });
 }
 
 export function updateAccountsEnabled(ids: string[], enabled: boolean, provider: AccountProvider): Promise<{ updated: number }> {
   return apiRequest("/api/admin/v1/accounts/batch", { method: "PATCH", body: { ids, enabled, provider } }, decodeCountResult<{ updated: number }>("updated"));
 }
 
+export function updateAccountsMaxConcurrent(ids: string[], maxConcurrent: number, provider: AccountProvider): Promise<{ updated: number }> {
+  return apiRequest("/api/admin/v1/accounts/batch", { method: "PATCH", body: { ids, maxConcurrent, provider } }, decodeCountResult<{ updated: number }>("updated"));
+}
+
 export function refreshAccountsQuota(ids: string[], provider: AccountProvider): Promise<{ succeeded: number; failed: number }> {
   return apiRequest("/api/admin/v1/accounts/batch/refresh-quotas", { method: "POST", body: { ids, provider } }, createObjectDecoder("account batch", { succeeded: isNumber, failed: isNumber }));
 }
 
-export function deleteAccounts(ids: string[], provider: AccountProvider): Promise<{ deleted: number }> {
-  return apiRequest("/api/admin/v1/accounts", { method: "DELETE", body: { ids, provider } }, decodeCountResult<{ deleted: number }>("deleted"));
+export function resetAccountsQuota(ids: string[], provider: AccountProvider): Promise<{ reset: number }> {
+  return apiRequest("/api/admin/v1/accounts/batch/reset-quota", { method: "POST", body: { ids, provider } }, decodeCountResult<{ reset: number }>("reset"));
+}
+
+export function resetAllAccountQuota(): Promise<{ reset: number }> {
+  return apiRequest("/api/admin/v1/accounts/reset-quota", { method: "POST" }, decodeCountResult<{ reset: number }>("reset"));
+}
+
+export function refreshAccountsTokens(ids: string[], provider: AccountProvider): Promise<AccountTokenRefreshResultDTO> {
+  return apiRequest("/api/admin/v1/accounts/batch/refresh-tokens", { method: "POST", body: { ids, provider } }, createObjectDecoder("account token refresh batch", { succeeded: isNumber, failed: isNumber, skipped: isNumber }));
+}
+
+export type CleanupResultDTO = {
+  deleted: number;
+  rootsDeleted?: number;
+  linkedDeleted?: number;
+  skipped?: number;
+  deletedByProvider?: Partial<Record<AccountProvider, number>>;
+};
+
+export type CleanupPreviewDTO = {
+  rootsByStatus: Partial<Record<AccountCleanupStatus, number>>;
+  rootCount: number;
+  linkedByProvider: Partial<Record<AccountProvider, number>>;
+  total: number;
+};
+
+export function cleanupAccounts(provider: AccountProvider, statuses: AccountCleanupStatus[], linkedDeleteTargets: LinkedDeleteTarget[] = []): Promise<CleanupResultDTO> {
+  return apiRequest(
+    "/api/admin/v1/accounts/cleanup",
+    {
+      method: "POST",
+      body: {
+        provider,
+        statuses,
+        ...(linkedDeleteTargets.length ? { linkedDeleteTargets } : {}),
+      },
+    },
+    createObjectDecoder("account cleanup", {
+      deleted: isNumber,
+      rootsDeleted: isOptional(isNumber),
+      linkedDeleted: isOptional(isNumber),
+      skipped: isOptional(isNumber),
+      deletedByProvider: isOptional(isRecordOf(isNumber)),
+    }),
+  );
+}
+
+export function previewCleanup(provider: AccountProvider, statuses: AccountCleanupStatus[], linkedDeleteTargets: LinkedDeleteTarget[] = []): Promise<CleanupPreviewDTO> {
+  return apiRequest(
+    "/api/admin/v1/accounts/cleanup-preview",
+    { method: "POST", body: { provider, statuses, ...(linkedDeleteTargets.length ? { linkedDeleteTargets } : {}) } },
+    createObjectDecoder("account cleanup preview", {
+      rootsByStatus: isRecordOf(isNumber),
+      rootCount: isNumber,
+      linkedByProvider: isRecordOf(isNumber),
+      total: isNumber,
+    }),
+  );
+}
+
+export function deleteAccounts(ids: string[], provider: AccountProvider, linkedDeleteTargets: LinkedDeleteTarget[] = []): Promise<AccountDeleteResultDTO> {
+  // Batch delete must forward linkedDeleteTargets; omitting them falls back to root-only deletion.
+  return apiRequest(
+    "/api/admin/v1/accounts",
+    {
+      method: "DELETE",
+      body: {
+        ids,
+        provider,
+        ...(linkedDeleteTargets.length ? { linkedDeleteTargets } : {}),
+      },
+    },
+    createObjectDecoder("account batch delete", {
+      deleted: isNumber,
+      rootsDeleted: isOptional(isNumber),
+      linkedDeleted: isOptional(isNumber),
+      skipped: isOptional(isNumber),
+      deletedByProvider: isOptional(isRecordOf(isNumber)),
+    }),
+  );
 }
 
 export function startDeviceAuthorization(): Promise<DeviceSessionDTO> {

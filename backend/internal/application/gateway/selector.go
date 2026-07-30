@@ -4,40 +4,95 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
+	"github.com/chenyme/grok2api/backend/internal/pkg/resultcache"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	"golang.org/x/sync/singleflight"
 )
 
 type accountLease struct {
-	Credential     account.Credential
-	Billing        *account.Billing
-	QuotaProbe     bool
-	QuotaProbeKind account.QuotaRecoveryKind
-	QuotaMode      string
-	release        func()
+	Credential          account.Credential
+	Billing             *account.Billing
+	QuotaProbe          bool
+	QuotaProbeKind      account.QuotaRecoveryKind
+	QuotaMode           string
+	selectorObservation *selectorLeaseObservation
+	release             func()
 }
 
 const quotaProbeLease = 5 * time.Minute
 const successPersistInterval = 30 * time.Second
-// candidateCacheTTL 只作为数据库状态的兜底刷新周期。账号健康和额度变化会在
-// 写库后同步更新或失效内存快照，没必要在大号池下每秒重建数万条候选记录。
-const candidateCacheTTL = 5 * time.Minute
+const candidateCacheTTL = time.Second
+const concurrencySnapshotTTL = 25 * time.Millisecond
+const maxConcurrencySnapshots = 256
+
+const modelAccessDeniedCooldown = 5 * time.Minute
+
+const defaultFreeQuotaRecoveryPause = 24 * time.Hour
+
+var errRoutingCredentialStale = errors.New("routing credential is no longer available")
+
+type quotaRecoveryHints struct {
+	Billing *account.Billing
+}
 
 type candidateSnapshot struct {
 	values    []account.RoutingCandidate
+	byAccount map[uint64]int
 	expiresAt time.Time
+}
+
+func newCandidateSnapshot(values []account.RoutingCandidate, expiresAt time.Time) candidateSnapshot {
+	byAccount := make(map[uint64]int, len(values))
+	for index, value := range values {
+		if _, exists := byAccount[value.Credential.ID]; !exists {
+			byAccount[value.Credential.ID] = index
+		}
+	}
+	return candidateSnapshot{values: values, byAccount: byAccount, expiresAt: expiresAt}
 }
 
 type candidateCacheKey struct {
 	provider      account.Provider
+	modelRouteID  uint64
 	upstreamModel string
 	quotaMode     string
+}
+
+type routingBaseCacheKey struct {
+	provider  account.Provider
+	quotaMode string
+}
+
+type routingOverlayCacheKey struct {
+	provider      account.Provider
+	modelRouteID  uint64
+	upstreamModel string
+}
+
+type routingLayerVersion struct {
+	global   uint64
+	provider uint64
+}
+
+type routingBaseSnapshot struct {
+	values    []account.RoutingAccountBase
+	version   routingLayerVersion
+	expiresAt time.Time
+}
+
+type routingOverlaySnapshot struct {
+	value     account.RoutingOverlaySnapshot
+	version   routingLayerVersion
+	expiresAt time.Time
 }
 
 type SelectionUnavailableReason string
@@ -55,52 +110,140 @@ const (
 type SelectionUnavailableError struct {
 	Reason     SelectionUnavailableReason
 	RetryAfter time.Duration
+	Scope      clientkeydomain.AccountScope
 }
 
 func (e *SelectionUnavailableError) Error() string {
 	if e == nil {
 		return "没有可用上游账号"
 	}
+	prefix := ""
+	if e.Scope.IsRestricted() {
+		prefix = "Client Key 限定范围"
+	}
 	switch e.Reason {
 	case SelectionUnsupportedModel:
+		if prefix != "" {
+			return prefix + "不支持该模型"
+		}
 		return "当前账号池不支持该模型"
 	case SelectionCooling:
+		if prefix != "" {
+			return prefix + "中的可用账号正在冷却"
+		}
 		return "可用上游账号正在冷却"
 	case SelectionModelCooling:
+		if prefix != "" {
+			return prefix + "中可用账号的目标模型正在冷却"
+		}
 		return "可用上游账号的目标模型正在冷却"
 	case SelectionQuotaExhausted:
+		if prefix != "" {
+			return prefix + "中的可用账号额度等待恢复"
+		}
 		return "可用上游账号额度等待恢复"
 	case SelectionSaturated:
+		if prefix != "" {
+			return prefix + "中的可用账号均达到并发上限"
+		}
 		return "可用上游账号均达到并发上限"
 	default:
+		if prefix != "" {
+			return prefix + "当前没有可用上游账号"
+		}
 		return "没有可用上游账号"
 	}
 }
 
+// HTTPStatus returns the client-facing status for a routing refusal.
+func (e *SelectionUnavailableError) HTTPStatus() int {
+	if e != nil {
+		switch e.Reason {
+		case SelectionCooling, SelectionModelCooling, SelectionQuotaExhausted:
+			return http.StatusTooManyRequests
+		}
+	}
+	return http.StatusServiceUnavailable
+}
+
+// Code returns the stable diagnostic code for a routing refusal.
+func (e *SelectionUnavailableError) Code() string {
+	if e != nil {
+		switch e.Reason {
+		case SelectionCooling:
+			return "upstream_cooling"
+		case SelectionModelCooling:
+			return "upstream_model_cooling"
+		case SelectionQuotaExhausted:
+			return "upstream_quota_exhausted"
+		case SelectionSaturated:
+			return "upstream_saturated"
+		case SelectionUnsupportedModel:
+			return "upstream_model_unavailable"
+		case SelectionNoAccounts:
+			if e.Scope.IsRestricted() {
+				return "client_key_account_scope_unavailable"
+			}
+		}
+	}
+	return "upstream_unavailable"
+}
+
 func (l *accountLease) Release() {
-	if l != nil && l.release != nil {
+	if l == nil {
+		return
+	}
+	if l.selectorObservation != nil {
+		l.selectorObservation.completeRelease()
+	}
+	if l.release != nil {
 		l.release()
 		l.release = nil
 	}
 }
 
+func (l *accountLease) markSelectorUpstreamStarted() {
+	if l != nil && l.selectorObservation != nil {
+		l.selectorObservation.upstreamStarted.Store(true)
+	}
+}
+
+func (l *accountLease) completeSelectorObservation(success bool) {
+	if l != nil && l.selectorObservation != nil {
+		l.selectorObservation.complete(success)
+	}
+}
+
 // Selector 实现可替换的 balanced 账号选择策略。
 type Selector struct {
-	accounts       repository.AccountRepository
-	concurrency    repository.ConcurrencyLimiter
-	sticky         repository.StickySessionRepository
-	stickyTTL      time.Duration
-	cooldownBase   time.Duration
-	cooldownMax    time.Duration
-	capacityWait   time.Duration
-	mu             sync.Mutex
-	leaseWakeMu    sync.Mutex
-	leaseWake      chan struct{}
-	lastSelectedAt map[uint64]time.Time
-	lastSuccessAt  map[uint64]time.Time
-	candidates     map[candidateCacheKey]candidateSnapshot
-	candidateLoads singleflight.Group
-	tierOrders     interface {
+	accounts               repository.AccountRepository
+	concurrency            repository.ConcurrencyLimiter
+	sticky                 repository.StickySessionRepository
+	stickyTTL              time.Duration
+	cooldownBase           time.Duration
+	cooldownMax            time.Duration
+	capacityWait           time.Duration
+	preferFreeBuild        bool
+	segmentedConfig        segmentedSelectorConfig
+	segmentedState         segmentedSelectorState
+	configMu               sync.RWMutex
+	candidateMu            sync.Mutex
+	selectionMu            sync.RWMutex
+	leaseWakeMu            sync.Mutex
+	leaseWake              chan struct{}
+	lastSelectedAt         map[uint64]time.Time
+	lastSuccessAt          map[uint64]time.Time
+	candidates             map[candidateCacheKey]candidateSnapshot
+	routingBases           map[routingBaseCacheKey]routingBaseSnapshot
+	routingOverlays        map[routingOverlayCacheKey]routingOverlaySnapshot
+	routingAccountProvider map[uint64]account.Provider
+	baseGlobalVersion      uint64
+	overlayGlobalVersion   uint64
+	baseProviderVersion    map[account.Provider]uint64
+	overlayProviderVersion map[account.Provider]uint64
+	candidateLoads         singleflight.Group
+	concurrencySnapshots   *resultcache.Cache[[32]byte, map[string]int]
+	tierOrders             interface {
 		TierOrder(account.Provider, string) []account.WebTier
 	}
 }
@@ -112,35 +255,71 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
-	s.mu.Lock()
+	s.configMu.Lock()
 	s.stickyTTL = stickyTTL
 	s.cooldownBase = cooldownBase
 	s.cooldownMax = cooldownMax
 	if len(capacityWait) > 0 {
 		s.capacityWait = max(time.Duration(0), capacityWait[0])
 	}
-	s.mu.Unlock()
+	s.configMu.Unlock()
+}
+
+// UpdatePreferFreeBuild 热更新 Build Free 账号优先策略。
+func (s *Selector) UpdatePreferFreeBuild(value bool) {
+	s.configMu.Lock()
+	s.preferFreeBuild = value
+	s.configMu.Unlock()
+}
+
+// UpdateSegmentedSelector changes the large-pool bounded planner policy.
+func (s *Selector) UpdateSegmentedSelector(enabled bool, minCandidates, windowSize int) {
+	s.configMu.Lock()
+	s.segmentedConfig = normalizeSegmentedSelectorConfig(segmentedSelectorConfig{
+		enabled: enabled, minCandidates: minCandidates, windowSize: windowSize,
+	})
+	s.configMu.Unlock()
 }
 
 func (s *Selector) routingConfig() (time.Duration, time.Duration, time.Duration, time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
 	return s.stickyTTL, s.cooldownBase, s.cooldownMax, s.capacityWait
 }
 
-func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstreamModel, quotaMode, promptCacheKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
+func (s *Selector) preferFreeBuildEnabled() bool {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.preferFreeBuild
+}
+
+func (s *Selector) Acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
+	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, clientkeydomain.AccountScope{})
+}
+
+func (s *Selector) AcquireForKey(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, scope clientkeydomain.AccountScope) (*accountLease, error) {
+	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope)
+}
+
+func (s *Selector) acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, requestedScope clientkeydomain.AccountScope) (lease *accountLease, err error) {
+	accountScope, scopeValid := clientkeydomain.NormalizeAccountScope(requestedScope)
+	defer annotateSelectionAccountScope(&err, accountScope)
+	if !scopeValid || !accountScope.AllowsProvider(provider) {
+		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
+	}
 	now := time.Now().UTC()
-	stickyKey := promptCacheStickyKey(promptCacheKey)
-	values, err := s.loadCandidates(ctx, provider, upstreamModel, quotaMode, now)
+	stickyKey := stickySessionKey(affinityKey)
+	values, err := s.loadCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode, now)
 	if err != nil {
 		return nil, err
 	}
+	// 仅保留候选下标，避免每个请求复制包含凭据、计费和额度结构的完整账号切片。
 	normalCandidates := make([]int, 0, len(values))
-	probeCandidates := make([]int, 0)
+	probeCandidates := make([]int, 0, len(values))
 	supportedCandidates := 0
 	consideredCandidates := 0
 	coolingCandidates := 0
@@ -149,6 +328,9 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 	var earliestRetry time.Time
 	for index, candidate := range values {
 		value := candidate.Credential
+		if !accountScopeAllowsCandidate(provider, accountScope, candidate) {
+			continue
+		}
 		if excluded[value.ID] || value.AuthStatus != account.AuthStatusActive {
 			continue
 		}
@@ -207,6 +389,8 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 		return nil, &SelectionUnavailableError{Reason: reason, RetryAfter: retryDelay(now, earliestRetry)}
 	}
 	if len(probeCandidates) > 0 {
+		staleClaims := 0
+		capacityMisses := 0
 		plan, err := s.planCandidateIndexes(ctx, values, probeCandidates, now, s.resolveTierOrder(provider, upstreamModel))
 		if err != nil {
 			return nil, err
@@ -214,9 +398,14 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 		for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
 			lease, err := s.claimAccountSlot(ctx, candidate.Credential)
 			if err != nil {
+				if errors.Is(err, errRoutingCredentialStale) {
+					staleClaims++
+					continue
+				}
 				return nil, err
 			}
 			if lease == nil {
+				capacityMisses++
 				continue
 			}
 			claimed, err := s.accounts.ClaimQuotaProbe(ctx, candidate.Credential.ID, now, now.Add(quotaProbeLease))
@@ -232,33 +421,85 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			lease.Billing = candidate.Billing
 			return lease, nil
 		}
+		if len(normalCandidates) == 0 && staleClaims > 0 && capacityMisses == 0 {
+			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+		}
 	}
+	var saturatedStickyID uint64
 	if stickyKey != "" {
 		stickyID, ok, err := s.sticky.Get(ctx, stickyKey, now)
 		if err != nil {
 			return nil, fmt.Errorf("读取会话粘滞状态: %w", err)
 		}
 		if ok {
-			for _, index := range normalCandidates {
-				candidate := values[index]
-				if candidate.Credential.ID == stickyID {
-					lease, acquireErr := s.claimAccountSlot(ctx, candidate.Credential)
-					if acquireErr != nil {
-						return nil, acquireErr
-					}
-					if lease != nil {
+			candidate, eligible := routingCandidateByID(values, normalCandidates, stickyID)
+			if eligible {
+				stickyTTL, _, _, _ := s.routingConfig()
+				boundID, bindErr := s.sticky.Bind(ctx, stickyKey, stickyID, now, now.Add(stickyTTL))
+				if bindErr != nil {
+					return nil, fmt.Errorf("刷新会话粘滞状态: %w", bindErr)
+				}
+				if boundID != stickyID {
+					candidate, eligible = routingCandidateByID(values, normalCandidates, boundID)
+					stickyID = boundID
+				}
+				if eligible {
+					lease, acquireErr := s.acquirePinnedCapacity(ctx, candidate.Credential)
+					if acquireErr == nil {
 						lease.Billing = candidate.Billing
 						lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
 						return lease, nil
 					}
+					if errors.Is(acquireErr, errRoutingCredentialStale) {
+						_ = s.sticky.DeleteByAccount(ctx, stickyID)
+					} else if !isSelectionUnavailable(acquireErr, SelectionSaturated) {
+						return nil, acquireErr
+					} else {
+						saturatedStickyID = stickyID
+					}
 				}
 			}
+		}
+	}
+	// 粘性账号仅因并发满载而暂时不可用时，先等待该账号；超时后允许本次请求临时借用
+	// 其他账号，但不覆盖原绑定，避免并行请求让活跃会话在账号池中来回抖动。
+	if saturatedStickyID != 0 {
+		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, time.Now().UTC(), s.resolveTierOrder(provider, upstreamModel))
+		if err != nil {
+			return nil, err
+		}
+		for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
+			if candidate.Credential.ID == saturatedStickyID {
+				continue
+			}
+			lease, claimErr := s.claimAccountSlot(ctx, candidate.Credential)
+			if claimErr != nil {
+				if errors.Is(claimErr, errRoutingCredentialStale) {
+					continue
+				}
+				return nil, claimErr
+			}
+			if lease == nil {
+				continue
+			}
+			lease.Billing = candidate.Billing
+			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
+			return lease, nil
+		}
+		return nil, &SelectionUnavailableError{Reason: SelectionSaturated, RetryAfter: time.Second}
+	}
+	if stickyKey == "" {
+		activeRequest := s.nextSegmentedActiveRequest(provider, upstreamModel, quotaMode, len(normalCandidates))
+		if activeRequest != nil {
+			return s.acquireSegmentedCandidates(ctx, values, normalCandidates, quotaMode, s.resolveTierOrder(provider, upstreamModel), *activeRequest)
 		}
 	}
 	_, _, _, capacityWait := s.routingConfig()
 	waitDeadline := time.Now().Add(capacityWait)
 	for {
 		currentTime := time.Now().UTC()
+		staleClaims := 0
+		capacityMisses := 0
 		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, currentTime, s.resolveTierOrder(provider, upstreamModel))
 		if err != nil {
 			return nil, err
@@ -266,21 +507,55 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 		for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
 			lease, err := s.claimAccountSlot(ctx, candidate.Credential)
 			if err != nil {
+				if errors.Is(err, errRoutingCredentialStale) {
+					staleClaims++
+					continue
+				}
 				return nil, err
 			}
 			if lease == nil {
+				capacityMisses++
 				continue
 			}
 			if stickyKey != "" {
 				stickyTTL, _, _, _ := s.routingConfig()
-				if err := s.sticky.Set(ctx, stickyKey, candidate.Credential.ID, currentTime.Add(stickyTTL)); err != nil {
+				boundID, bindErr := s.sticky.Bind(ctx, stickyKey, candidate.Credential.ID, currentTime, currentTime.Add(stickyTTL))
+				if bindErr != nil {
 					lease.Release()
-					return nil, fmt.Errorf("写入会话粘滞状态: %w", err)
+					return nil, fmt.Errorf("写入会话粘滞状态: %w", bindErr)
+				}
+				if boundID != candidate.Credential.ID {
+					if boundCandidate, eligible := routingCandidateByID(values, normalCandidates, boundID); eligible {
+						boundLease, boundErr := s.acquirePinnedCapacity(ctx, boundCandidate.Credential)
+						if boundErr == nil {
+							lease.Release()
+							boundLease.Billing = boundCandidate.Billing
+							boundLease.QuotaMode = effectiveQuotaMode(boundCandidate, quotaMode)
+							return boundLease, nil
+						}
+						if errors.Is(boundErr, errRoutingCredentialStale) {
+							_ = s.sticky.DeleteByAccount(ctx, boundID)
+							if err := s.sticky.Set(ctx, stickyKey, candidate.Credential.ID, currentTime.Add(stickyTTL)); err != nil {
+								lease.Release()
+								return nil, fmt.Errorf("重建会话粘滞状态: %w", err)
+							}
+						} else if !isSelectionUnavailable(boundErr, SelectionSaturated) {
+							lease.Release()
+							return nil, boundErr
+						}
+						// 已绑定账号满载时保留原绑定，本次请求使用已获取的临时账号。
+					} else if err := s.sticky.Set(ctx, stickyKey, candidate.Credential.ID, currentTime.Add(stickyTTL)); err != nil {
+						lease.Release()
+						return nil, fmt.Errorf("重建会话粘滞状态: %w", err)
+					}
 				}
 			}
 			lease.Billing = candidate.Billing
 			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
 			return lease, nil
+		}
+		if staleClaims > 0 && capacityMisses == 0 {
+			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 		}
 		if capacityWait <= 0 {
 			return nil, &SelectionUnavailableError{Reason: SelectionSaturated, RetryAfter: time.Second}
@@ -295,8 +570,8 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 	}
 }
 
-// promptCacheStickyKey 将调用方缓存键压缩为固定长度，仅用于本地账号粘滞索引。
-func promptCacheStickyKey(value string) string {
+// stickySessionKey 将调用方粘滞 identity 压缩为固定长度，仅用于账号粘滞索引。
+func stickySessionKey(value string) string {
 	if value == "" {
 		return ""
 	}
@@ -304,10 +579,38 @@ func promptCacheStickyKey(value string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func routingCandidateByID(values []account.RoutingCandidate, indexes []int, accountID uint64) (account.RoutingCandidate, bool) {
+	for _, index := range indexes {
+		candidate := values[index]
+		if candidate.Credential.ID == accountID {
+			return candidate, true
+		}
+	}
+	return account.RoutingCandidate{}, false
+}
+
+func isSelectionUnavailable(err error, reason SelectionUnavailableReason) bool {
+	var unavailable *SelectionUnavailableError
+	return errors.As(err, &unavailable) && unavailable.Reason == reason
+}
+
 // AcquirePinned 为 previous_response_id 等账号归属请求获取指定账号租约。
-func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider, accountID uint64, upstreamModel, quotaMode string, inference bool) (*accountLease, error) {
+func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference bool) (*accountLease, error) {
+	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, clientkeydomain.AccountScope{})
+}
+
+func (s *Selector) AcquirePinnedForKey(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference bool, scope clientkeydomain.AccountScope) (*accountLease, error) {
+	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, scope)
+}
+
+func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference bool, requestedScope clientkeydomain.AccountScope) (lease *accountLease, err error) {
+	accountScope, scopeValid := clientkeydomain.NormalizeAccountScope(requestedScope)
+	defer annotateSelectionAccountScope(&err, accountScope)
+	if !scopeValid || !accountScope.AllowsProvider(provider) {
+		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
+	}
 	now := time.Now().UTC()
-	values, err := s.loadCandidates(ctx, provider, upstreamModel, quotaMode, now)
+	values, err := s.loadCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode, now)
 	if err != nil {
 		return nil, err
 	}
@@ -315,6 +618,9 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 		value := candidate.Credential
 		if value.ID != accountID {
 			continue
+		}
+		if !accountScopeAllowsCandidate(provider, accountScope, candidate) {
+			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 		}
 		if !value.Enabled || value.AuthStatus != account.AuthStatusActive {
 			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
@@ -339,6 +645,9 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 				}
 				lease, err := s.acquirePinnedCapacity(ctx, value)
 				if err != nil {
+					if errors.Is(err, errRoutingCredentialStale) {
+						return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+					}
 					return nil, err
 				}
 				claimed, err := s.accounts.ClaimQuotaProbe(ctx, value.ID, now, now.Add(quotaProbeLease))
@@ -367,6 +676,9 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 		}
 		lease, err := s.acquirePinnedCapacity(ctx, value)
 		if err != nil {
+			if errors.Is(err, errRoutingCredentialStale) {
+				return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+			}
 			return nil, err
 		}
 		lease.Billing = candidate.Billing
@@ -374,6 +686,46 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 		return lease, nil
 	}
 	return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+}
+
+func accountScopeAllowsCandidate(provider account.Provider, scope clientkeydomain.AccountScope, candidate account.RoutingCandidate) bool {
+	if provider == account.ProviderConsole {
+		return true
+	}
+	tier := clientkeydomain.AccountTierUnknown
+	switch provider {
+	case account.ProviderBuild:
+		if candidate.IsKnownFreeBuild() {
+			tier = clientkeydomain.AccountTierFree
+		} else if account.IsBuildSuper(candidate.Credential, candidate.Billing) {
+			tier = clientkeydomain.AccountTierSuper
+		}
+	case account.ProviderWeb:
+		switch candidate.Credential.WebTier {
+		case account.WebTierBasic:
+			tier = clientkeydomain.AccountTierFree
+		case account.WebTierSuper, account.WebTierHeavy:
+			tier = clientkeydomain.AccountTierSuper
+		}
+	}
+	switch tier {
+	case clientkeydomain.AccountTierFree:
+		return scope.Tiers&clientkeydomain.TierScopeFree != 0
+	case clientkeydomain.AccountTierSuper:
+		return scope.Tiers&clientkeydomain.TierScopeSuper != 0
+	default:
+		return scope.Tiers&clientkeydomain.TierScopeUnknown != 0
+	}
+}
+
+func annotateSelectionAccountScope(err *error, scope clientkeydomain.AccountScope) {
+	if err == nil || *err == nil || !scope.IsRestricted() {
+		return
+	}
+	var unavailable *SelectionUnavailableError
+	if errors.As(*err, &unavailable) {
+		unavailable.Scope = scope
+	}
 }
 
 func effectiveQuotaMode(candidate account.RoutingCandidate, fallback string) string {
@@ -390,14 +742,14 @@ func (s *Selector) MarkSuccess(ctx context.Context, credential account.Credentia
 func (s *Selector) markSuccess(ctx context.Context, credential account.Credential, quotaProbe bool) {
 	now := time.Now().UTC()
 	persist := credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != ""
-	s.mu.Lock()
+	s.selectionMu.Lock()
 	if last := s.lastSuccessAt[credential.ID]; last.IsZero() || now.Sub(last) >= successPersistInterval {
 		persist = true
 	}
 	if persist {
 		s.lastSuccessAt[credential.ID] = now
 	}
-	s.mu.Unlock()
+	s.selectionMu.Unlock()
 	if persist {
 		_ = s.accounts.UpdateHealth(ctx, credential.ID, 0, nil, "", true)
 	}
@@ -411,7 +763,11 @@ func (s *Selector) markSuccess(ctx context.Context, credential account.Credentia
 
 func (s *Selector) MarkFreeQuotaExhausted(ctx context.Context, credential account.Credential, used, limit int64) {
 	now := time.Now().UTC()
-	nextProbeAt := now.Add(24 * time.Hour)
+	nextProbeAt := now.Add(defaultFreeQuotaRecoveryPause)
+	s.markFreeQuotaExhaustedAt(ctx, credential, used, limit, now, nextProbeAt)
+}
+
+func (s *Selector) markFreeQuotaExhaustedAt(ctx context.Context, credential account.Credential, used, limit int64, now, nextProbeAt time.Time) {
 	_ = s.accounts.SaveQuotaRecovery(ctx, account.QuotaRecovery{
 		AccountID: credential.ID, Kind: account.QuotaRecoveryKindFree, Status: account.QuotaRecoveryStatusExhausted,
 		ConfirmedUsed: used, ConfirmedLimit: limit, ExhaustedAt: &now,
@@ -421,109 +777,129 @@ func (s *Selector) MarkFreeQuotaExhausted(ctx context.Context, credential accoun
 	s.invalidateCandidates(credential.Provider)
 }
 
-func (s *Selector) MarkModelQuotaExhausted(ctx context.Context, credential account.Credential, upstreamModel string, retryAfter time.Duration) {
+func (s *Selector) MarkModelQuotaExhausted(ctx context.Context, credential account.Credential, billing *account.Billing, upstreamModel string, retryAfter time.Duration) {
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
 		s.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
 		return
 	}
-	if retryAfter <= 0 {
-		retryAfter = 24 * time.Hour
+	knownFreeBuild := (account.RoutingCandidate{Credential: credential, Billing: billing}).IsKnownFreeBuild()
+	if knownFreeBuild || retryAfter <= 0 {
+		retryAfter = defaultFreeQuotaRecoveryPause
 	}
 	until := time.Now().UTC().Add(retryAfter)
 	_ = s.accounts.UpsertModelQuotaBlock(ctx, account.ModelQuotaBlock{
 		AccountID: credential.ID, UpstreamModel: upstreamModel, Reason: "model_quota_depleted", CooldownUntil: until, UpdatedAt: time.Now().UTC(),
 	})
+	// The model block makes affected bindings ineligible and they are rebound on
+	// the next request. Preserve unrelated model/session affinity for this account.
 	s.invalidateCandidates(credential.Provider)
 }
 
-// MarkPaidQuotaExhausted 使用已知真实账期将付费账号移出号池，到期后才允许 Billing 探测。
-func (s *Selector) MarkPaidQuotaExhausted(ctx context.Context, credential account.Credential, billing *account.Billing) bool {
-	if billing == nil || (billing.MonthlyLimit <= 0 && billing.OnDemandCap <= 0 && billing.OnDemandUsed <= 0 && billing.PrepaidBalance <= 0 && billing.CreditUsagePercent <= 0) {
-		return false
+// MarkModelAccessDenied isolates a permission failure to the rejected model.
+// Build OAuth accounts may still have valid video access when a chat endpoint
+// returns 403, so a model denial must not invalidate the whole credential.
+func (s *Selector) MarkModelAccessDenied(ctx context.Context, credential account.Credential, upstreamModel string, retryAfter time.Duration) {
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	if upstreamModel == "" {
+		return
 	}
-	periodEnd, ok := billing.PeriodEnd()
-	if !ok {
-		return false
+	if retryAfter <= 0 {
+		retryAfter = modelAccessDeniedCooldown
 	}
 	now := time.Now().UTC()
-	_ = s.accounts.SaveQuotaRecovery(ctx, account.QuotaRecovery{
-		AccountID: credential.ID, Kind: account.QuotaRecoveryKindPaid, Status: account.QuotaRecoveryStatusExhausted,
-		ExhaustedAt: &now, NextProbeAt: &periodEnd, LastConfirmedAt: &now, UpdatedAt: now,
+	_ = s.accounts.UpsertModelQuotaBlock(ctx, account.ModelQuotaBlock{
+		AccountID: credential.ID, UpstreamModel: upstreamModel, Reason: "model_access_denied",
+		CooldownUntil: now.Add(retryAfter), UpdatedAt: now,
 	})
-	_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 	s.invalidateCandidates(credential.Provider)
-	return true
+}
+
+// MarkPaymentQuotaExhausted removes a spending-limited account from routing.
+// Paid accounts follow their upstream billing period; Free or unknown accounts
+// use the fixed local recovery window.
+func (s *Selector) MarkPaymentQuotaExhausted(ctx context.Context, credential account.Credential, hints quotaRecoveryHints) {
+	now := time.Now().UTC()
+	if hints.Billing != nil && hints.Billing.IsPaid() {
+		if periodEnd, ok := hints.Billing.PeriodEnd(); ok && periodEnd.After(now) {
+			_ = s.accounts.SaveQuotaRecovery(ctx, account.QuotaRecovery{
+				AccountID: credential.ID, Kind: account.QuotaRecoveryKindPaid, Status: account.QuotaRecoveryStatusExhausted,
+				ExhaustedAt: &now, NextProbeAt: &periodEnd, LastConfirmedAt: &now, UpdatedAt: now,
+			})
+			_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+			s.invalidateCandidates(credential.Provider)
+			return
+		}
+	}
+	s.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
 }
 
 // MarkQuotaStateChanged 在 Billing 探测改变持久化额度状态后立即失效候选快照。
 func (s *Selector) MarkQuotaStateChanged(provider account.Provider) { s.invalidateCandidates(provider) }
-
-// RemoveAccount 在账号已被持久化为不可路由状态后，只从现有不可变快照中移除
-// 这一条账号并清理 sticky。避免为单账号 401/403 清空整个 Provider 缓存并重新扫库。
-func (s *Selector) RemoveAccount(ctx context.Context, provider account.Provider, accountID uint64) {
-	if accountID == 0 {
-		return
-	}
-	_ = s.sticky.DeleteByAccount(ctx, accountID)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for key, snapshot := range s.candidates {
-		if key.provider != provider {
-			continue
-		}
-		index := -1
-		for candidateIndex := range snapshot.values {
-			if snapshot.values[candidateIndex].Credential.ID == accountID {
-				index = candidateIndex
-				break
-			}
-		}
-		if index < 0 {
-			continue
-		}
-		values := make([]account.RoutingCandidate, 0, len(snapshot.values)-1)
-		values = append(values, snapshot.values[:index]...)
-		values = append(values, snapshot.values[index+1:]...)
-		snapshot.values = values
-		s.candidates[key] = snapshot
-	}
-}
 
 // ConsumeQuota 将成功请求的本地额度变化应用到候选快照，避免为单账号变化清空整个 Provider 缓存。
 func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mode string, amount int) {
 	if accountID == 0 || mode == "" || mode == "weekly" || amount <= 0 {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
 	for key, snapshot := range s.candidates {
 		if key.provider != provider {
 			continue
 		}
-		var cloned []account.RoutingCandidate
-		for index := range snapshot.values {
-			candidate := &snapshot.values[index]
-			if candidate.Credential.ID != accountID || candidate.QuotaWindow == nil || candidate.QuotaWindow.Mode != mode {
-				continue
+		index, found := snapshot.byAccount[accountID]
+		if !found || index >= len(snapshot.values) {
+			continue
+		}
+		candidate := snapshot.values[index]
+		if candidate.QuotaWindow == nil || candidate.QuotaWindow.Mode != mode {
+			continue
+		}
+		next := append([]account.RoutingCandidate(nil), snapshot.values...)
+		window := *next[index].QuotaWindow
+		window.Remaining = max(0, window.Remaining-amount)
+		window.UpdatedAt = time.Now().UTC()
+		next[index].QuotaWindow = &window
+		snapshot.values = next
+		s.candidates[key] = snapshot
+	}
+	for key, snapshot := range s.routingBases {
+		if key.provider != provider {
+			continue
+		}
+		index := -1
+		for candidateIndex, base := range snapshot.values {
+			if base.Credential.ID == accountID {
+				index = candidateIndex
+				break
 			}
-			cloned = append([]account.RoutingCandidate(nil), snapshot.values...)
-			candidate = &cloned[index]
-			window := *candidate.QuotaWindow
-			window.Remaining = max(0, window.Remaining-amount)
-			window.UpdatedAt = time.Now().UTC()
-			candidate.QuotaWindow = &window
-			break
 		}
-		if cloned != nil {
-			snapshot.values = cloned
-			s.candidates[key] = snapshot
+		if index < 0 || snapshot.values[index].QuotaWindow == nil || snapshot.values[index].QuotaWindow.Mode != mode {
+			continue
 		}
+		next := append([]account.RoutingAccountBase(nil), snapshot.values...)
+		window := *next[index].QuotaWindow
+		window.Remaining = max(0, window.Remaining-amount)
+		window.UpdatedAt = time.Now().UTC()
+		next[index].QuotaWindow = &window
+		snapshot.values = next
+		s.routingBases[key] = snapshot
 	}
 }
 
 func (s *Selector) MarkFailure(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) {
-	failureCount := credential.FailureCount + 1
+	_ = s.markFailure(ctx, credential, credential.FailureCount+1, status, retryAfter)
+}
+
+// MarkFailureAfterSuccess records a stream failure from a fresh health baseline.
+// The upstream already returned a successful response header, so failures that
+// preceded this request must not be carried into the new cooldown calculation.
+func (s *Selector) MarkFailureAfterSuccess(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) error {
+	return s.markFailure(ctx, credential, 1, status, retryAfter)
+}
+
+func (s *Selector) markFailure(ctx context.Context, credential account.Credential, failureCount, status int, retryAfter time.Duration) error {
 	_, cooldownBase, cooldownMax, _ := s.routingConfig()
 	cooldown := cooldownBase
 	for i := 1; i < failureCount && cooldown < cooldownMax; i++ {
@@ -536,39 +912,45 @@ func (s *Selector) MarkFailure(ctx context.Context, credential account.Credentia
 		cooldown = retryAfter
 	}
 	until := time.Now().UTC().Add(cooldown)
-	_ = s.accounts.UpdateHealth(ctx, credential.ID, failureCount, &until, fmt.Sprintf("upstream status %d", status), false)
-	s.updateCandidateHealth(credential.Provider, credential.ID, failureCount, &until, fmt.Sprintf("upstream status %d", status))
+	healthErr := s.accounts.UpdateHealth(ctx, credential.ID, failureCount, &until, fmt.Sprintf("upstream status %d", status), false)
+	s.invalidateCandidates(credential.Provider)
 	if status == 401 || status == 402 || status == 403 || status == 429 {
 		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 	}
+	return healthErr
 }
 
-func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider, upstreamModel, quotaMode string, now time.Time) ([]account.RoutingCandidate, error) {
-	key := candidateCacheKey{provider: provider, upstreamModel: upstreamModel, quotaMode: quotaMode}
-	s.mu.Lock()
-	if snapshot, ok := s.candidates[key]; ok && now.Before(snapshot.expiresAt) {
-		values := snapshot.values
-		s.mu.Unlock()
-		return values, nil
+func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string, now time.Time) ([]account.RoutingCandidate, error) {
+	if _, ok := s.accounts.(repository.RoutingLayerRepository); ok {
+		return s.loadLayeredCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode, now)
 	}
-	s.mu.Unlock()
-	loadKey := string(provider) + "\x00" + upstreamModel + "\x00" + quotaMode
+	return s.loadCombinedCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode, now)
+}
+
+func (s *Selector) loadCombinedCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string, now time.Time) ([]account.RoutingCandidate, error) {
+	key := candidateCacheKey{provider: provider, modelRouteID: modelRouteID, upstreamModel: upstreamModel, quotaMode: quotaMode}
+	s.candidateMu.Lock()
+	if snapshot, ok := s.candidates[key]; ok && now.Before(snapshot.expiresAt) {
+		s.candidateMu.Unlock()
+		return snapshot.values, nil
+	}
+	s.candidateMu.Unlock()
+	loadKey := fmt.Sprintf("%s\x00%d\x00%s\x00%s", provider, modelRouteID, upstreamModel, quotaMode)
 	loaded, err, _ := s.candidateLoads.Do(loadKey, func() (any, error) {
 		checkTime := time.Now().UTC()
-		s.mu.Lock()
+		s.candidateMu.Lock()
 		if snapshot, ok := s.candidates[key]; ok && checkTime.Before(snapshot.expiresAt) {
-			values := snapshot.values
-			s.mu.Unlock()
-			return values, nil
+			s.candidateMu.Unlock()
+			return snapshot.values, nil
 		}
-		s.mu.Unlock()
-		values, err := s.accounts.ListRoutingCandidates(ctx, provider, upstreamModel, quotaMode)
+		s.candidateMu.Unlock()
+		values, err := s.accounts.ListRoutingCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode)
 		if err != nil {
 			return nil, err
 		}
-		s.mu.Lock()
-		s.candidates[key] = candidateSnapshot{values: append([]account.RoutingCandidate(nil), values...), expiresAt: checkTime.Add(candidateCacheTTL)}
-		s.mu.Unlock()
+		s.candidateMu.Lock()
+		s.candidates[key] = newCandidateSnapshot(values, checkTime.Add(candidateCacheTTL))
+		s.candidateMu.Unlock()
 		return values, nil
 	})
 	if err != nil {
@@ -577,38 +959,287 @@ func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider
 	return loaded.([]account.RoutingCandidate), nil
 }
 
-// updateCandidateHealth 以 copy-on-write 更新单账号健康状态，避免一次 429 清空整个
-// Provider 的候选缓存。已发布的快照不会原地修改，因此并发选号可以无锁读取。
-func (s *Selector) updateCandidateHealth(provider account.Provider, accountID uint64, failureCount int, cooldownUntil *time.Time, lastError string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for key, snapshot := range s.candidates {
-		if key.provider != provider {
-			continue
+func (s *Selector) loadLayeredCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string, now time.Time) ([]account.RoutingCandidate, error) {
+	key := candidateCacheKey{provider: provider, modelRouteID: modelRouteID, upstreamModel: upstreamModel, quotaMode: quotaMode}
+	s.candidateMu.Lock()
+	if snapshot, ok := s.candidates[key]; ok && now.Before(snapshot.expiresAt) {
+		s.candidateMu.Unlock()
+		return snapshot.values, nil
+	}
+	s.candidateMu.Unlock()
+	loadKey := fmt.Sprintf("assembled\x00%s\x00%d\x00%s\x00%s", provider, modelRouteID, upstreamModel, quotaMode)
+	loaded, err, _ := s.candidateLoads.Do(loadKey, func() (any, error) {
+		checkTime := time.Now().UTC()
+		s.candidateMu.Lock()
+		if snapshot, ok := s.candidates[key]; ok && checkTime.Before(snapshot.expiresAt) {
+			s.candidateMu.Unlock()
+			return snapshot.values, nil
 		}
-		for index := range snapshot.values {
-			if snapshot.values[index].Credential.ID != accountID {
+		s.candidateMu.Unlock()
+		layered := s.accounts.(repository.RoutingLayerRepository)
+		for attempt := 0; attempt < 4; attempt++ {
+			bases, baseVersion, loadErr := s.loadRoutingBases(ctx, layered, provider, quotaMode, checkTime)
+			if loadErr != nil {
+				return nil, loadErr
+			}
+			overlay, overlayVersion, loadErr := s.loadRoutingOverlay(ctx, layered, provider, modelRouteID, upstreamModel, checkTime)
+			if loadErr != nil {
+				return nil, loadErr
+			}
+			if !s.routingVersionsStable(provider, baseVersion, overlayVersion) {
+				checkTime = time.Now().UTC()
 				continue
 			}
-			values := append([]account.RoutingCandidate(nil), snapshot.values...)
-			values[index].Credential.FailureCount = failureCount
-			values[index].Credential.CooldownUntil = cooldownUntil
-			values[index].Credential.LastError = lastError
-			snapshot.values = values
-			s.candidates[key] = snapshot
-			break
+			values := assembleRoutingCandidates(provider, bases, overlay)
+			s.candidateMu.Lock()
+			stable := baseVersion == s.routingBaseVersionLocked(provider) && overlayVersion == s.routingOverlayVersionLocked(provider)
+			if stable {
+				s.candidates[key] = newCandidateSnapshot(values, checkTime.Add(candidateCacheTTL))
+			}
+			s.candidateMu.Unlock()
+			if stable {
+				return values, nil
+			}
+			checkTime = time.Now().UTC()
+		}
+		// Sustained account synchronization must not turn cache churn into user-facing
+		// failures. Fall back to the established authoritative combined query.
+		return s.accounts.ListRoutingCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return loaded.([]account.RoutingCandidate), nil
+}
+
+func (s *Selector) loadRoutingBases(ctx context.Context, layered repository.RoutingLayerRepository, provider account.Provider, quotaMode string, now time.Time) ([]account.RoutingAccountBase, routingLayerVersion, error) {
+	key := routingBaseCacheKey{provider: provider, quotaMode: quotaMode}
+	version := s.routingBaseVersion(provider)
+	s.candidateMu.Lock()
+	if snapshot, ok := s.routingBases[key]; ok && now.Before(snapshot.expiresAt) && snapshot.version == version {
+		values := snapshot.values
+		s.candidateMu.Unlock()
+		return values, version, nil
+	}
+	s.candidateMu.Unlock()
+	loadKey := "base\x00" + string(provider) + "\x00" + quotaMode
+	loaded, err, _ := s.candidateLoads.Do(loadKey, func() (any, error) {
+		checkTime := time.Now().UTC()
+		checkVersion := s.routingBaseVersion(provider)
+		s.candidateMu.Lock()
+		if snapshot, ok := s.routingBases[key]; ok && checkTime.Before(snapshot.expiresAt) && snapshot.version == checkVersion {
+			values := snapshot.values
+			s.candidateMu.Unlock()
+			return routingBaseLoadResult{values: values, version: checkVersion}, nil
+		}
+		s.candidateMu.Unlock()
+		values, loadErr := layered.ListRoutingAccountBases(ctx, provider, quotaMode)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		s.candidateMu.Lock()
+		currentVersion := s.routingBaseVersionLocked(provider)
+		if currentVersion == checkVersion {
+			s.routingBases[key] = routingBaseSnapshot{values: values, version: checkVersion, expiresAt: checkTime.Add(candidateCacheTTL)}
+			for accountID, cachedProvider := range s.routingAccountProvider {
+				if cachedProvider == provider {
+					delete(s.routingAccountProvider, accountID)
+				}
+			}
+			for _, value := range values {
+				s.routingAccountProvider[value.Credential.ID] = provider
+			}
+		}
+		s.candidateMu.Unlock()
+		return routingBaseLoadResult{values: values, version: checkVersion}, nil
+	})
+	if err != nil {
+		return nil, routingLayerVersion{}, err
+	}
+	result := loaded.(routingBaseLoadResult)
+	return result.values, result.version, nil
+}
+
+func (s *Selector) loadRoutingOverlay(ctx context.Context, layered repository.RoutingLayerRepository, provider account.Provider, modelRouteID uint64, upstreamModel string, now time.Time) (account.RoutingOverlaySnapshot, routingLayerVersion, error) {
+	key := routingOverlayCacheKey{provider: provider, modelRouteID: modelRouteID, upstreamModel: upstreamModel}
+	version := s.routingOverlayVersion(provider)
+	s.candidateMu.Lock()
+	if snapshot, ok := s.routingOverlays[key]; ok && now.Before(snapshot.expiresAt) && snapshot.version == version {
+		value := snapshot.value
+		s.candidateMu.Unlock()
+		return value, version, nil
+	}
+	s.candidateMu.Unlock()
+	loadKey := fmt.Sprintf("overlay\x00%s\x00%d\x00%s", provider, modelRouteID, upstreamModel)
+	loaded, err, _ := s.candidateLoads.Do(loadKey, func() (any, error) {
+		checkTime := time.Now().UTC()
+		checkVersion := s.routingOverlayVersion(provider)
+		s.candidateMu.Lock()
+		if snapshot, ok := s.routingOverlays[key]; ok && checkTime.Before(snapshot.expiresAt) && snapshot.version == checkVersion {
+			value := snapshot.value
+			s.candidateMu.Unlock()
+			return routingOverlayLoadResult{value: value, version: checkVersion}, nil
+		}
+		s.candidateMu.Unlock()
+		value, loadErr := layered.ListRoutingAccountOverlays(ctx, provider, modelRouteID, upstreamModel)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		s.candidateMu.Lock()
+		currentVersion := s.routingOverlayVersionLocked(provider)
+		if currentVersion == checkVersion {
+			s.routingOverlays[key] = routingOverlaySnapshot{value: value, version: checkVersion, expiresAt: checkTime.Add(candidateCacheTTL)}
+		}
+		s.candidateMu.Unlock()
+		return routingOverlayLoadResult{value: value, version: checkVersion}, nil
+	})
+	if err != nil {
+		return account.RoutingOverlaySnapshot{}, routingLayerVersion{}, err
+	}
+	result := loaded.(routingOverlayLoadResult)
+	return result.value, result.version, nil
+}
+
+func (s *Selector) routingBaseVersion(provider account.Provider) routingLayerVersion {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	return s.routingBaseVersionLocked(provider)
+}
+
+func (s *Selector) routingBaseVersionLocked(provider account.Provider) routingLayerVersion {
+	return routingLayerVersion{global: s.baseGlobalVersion, provider: s.baseProviderVersion[provider]}
+}
+
+func (s *Selector) routingOverlayVersion(provider account.Provider) routingLayerVersion {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	return s.routingOverlayVersionLocked(provider)
+}
+
+func (s *Selector) routingOverlayVersionLocked(provider account.Provider) routingLayerVersion {
+	return routingLayerVersion{global: s.overlayGlobalVersion, provider: s.overlayProviderVersion[provider]}
+}
+
+func (s *Selector) routingVersionsStable(provider account.Provider, base, overlay routingLayerVersion) bool {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	return base == s.routingBaseVersionLocked(provider) && overlay == s.routingOverlayVersionLocked(provider)
+}
+
+// ApplyInvalidation advances local layer generations before any remote publish.
+func (s *Selector) ApplyInvalidation(event repository.InvalidationEvent) {
+	if !event.Valid() {
+		return
+	}
+	layer := event.Layer()
+	if layer != repository.InvalidationLayerRoute && layer != repository.InvalidationLayerBase && layer != repository.InvalidationLayerOverlay {
+		return
+	}
+	s.candidateMu.Lock()
+	provider := event.Provider
+	if provider == "" && event.AccountID != 0 {
+		provider = s.routingAccountProvider[event.AccountID]
+		if provider == "" {
+			for key, snapshot := range s.candidates {
+				if _, ok := snapshot.byAccount[event.AccountID]; ok {
+					provider = key.provider
+					break
+				}
+			}
+		}
+	}
+	base := layer == repository.InvalidationLayerBase
+	overlay := layer == repository.InvalidationLayerOverlay || layer == repository.InvalidationLayerRoute
+	if base {
+		if provider == "" {
+			s.baseGlobalVersion++
+			clearRoutingBases(s.routingBases, "")
+		} else {
+			s.baseProviderVersion[provider]++
+			clearRoutingBases(s.routingBases, provider)
+		}
+	}
+	if overlay {
+		if provider == "" {
+			s.overlayGlobalVersion++
+			clearRoutingOverlays(s.routingOverlays, "")
+		} else {
+			s.overlayProviderVersion[provider]++
+			clearRoutingOverlays(s.routingOverlays, provider)
+		}
+	}
+	for key := range s.candidates {
+		if provider == "" || key.provider == provider {
+			delete(s.candidates, key)
+		}
+	}
+	s.candidateMu.Unlock()
+}
+
+func clearRoutingBases(values map[routingBaseCacheKey]routingBaseSnapshot, provider account.Provider) {
+	for key := range values {
+		if provider == "" || key.provider == provider {
+			delete(values, key)
 		}
 	}
 }
 
-func (s *Selector) invalidateCandidates(provider account.Provider) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for key := range s.candidates {
-		if key.provider == provider {
-			delete(s.candidates, key)
+func clearRoutingOverlays(values map[routingOverlayCacheKey]routingOverlaySnapshot, provider account.Provider) {
+	for key := range values {
+		if provider == "" || key.provider == provider {
+			delete(values, key)
 		}
 	}
+}
+
+type routingBaseLoadResult struct {
+	values  []account.RoutingAccountBase
+	version routingLayerVersion
+}
+
+type routingOverlayLoadResult struct {
+	value   account.RoutingOverlaySnapshot
+	version routingLayerVersion
+}
+
+func assembleRoutingCandidates(provider account.Provider, bases []account.RoutingAccountBase, overlay account.RoutingOverlaySnapshot) []account.RoutingCandidate {
+	byAccount := make(map[uint64]account.RoutingAccountOverlay, len(overlay.Values))
+	for _, value := range overlay.Values {
+		byAccount[value.AccountID] = value
+	}
+	sharedSuperBuildModel := false
+	if provider == account.ProviderBuild && !overlay.HasBindings {
+		for _, base := range bases {
+			value, exists := byAccount[base.Credential.ID]
+			if exists && value.SupportsModel && account.IsBuildSuper(base.Credential, base.Billing) {
+				sharedSuperBuildModel = true
+				break
+			}
+		}
+	}
+	result := make([]account.RoutingCandidate, 0, len(bases))
+	for _, base := range bases {
+		overlayValue := byAccount[base.Credential.ID]
+		if overlay.HasBindings && !overlayValue.Bound {
+			continue
+		}
+		known, supports := overlayValue.ModelCapabilityKnown, overlayValue.SupportsModel
+		if overlay.HasBindings {
+			known, supports = true, true
+		} else if sharedSuperBuildModel && account.IsBuildSuper(base.Credential, base.Billing) {
+			known, supports = true, true
+		}
+		result = append(result, account.RoutingCandidate{
+			Credential: base.Credential, Billing: base.Billing, QuotaWindow: base.QuotaWindow, QuotaRecovery: base.QuotaRecovery,
+			ModelQuotaBlock: overlayValue.ModelQuotaBlock, ModelCapabilityKnown: known, SupportsModel: supports,
+		})
+	}
+	return result
+}
+
+func (s *Selector) invalidateCandidates(provider account.Provider) {
+	s.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: provider})
+	s.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountCapabilityChanged, Provider: provider})
 }
 
 func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credential) (*accountLease, error) {
@@ -623,12 +1254,33 @@ func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credentia
 	if !acquired {
 		return nil, nil
 	}
-	s.mu.Lock()
-	s.lastSelectedAt[value.ID] = time.Now().UTC()
-	s.mu.Unlock()
-	return &accountLease{Credential: value, release: func() {
+	releaseSlot := func() {
 		release()
 		s.announceLeaseReturn()
+	}
+	if s.accounts != nil {
+		material, loadErr := s.accounts.GetCredentialMaterial(ctx, value.ID, value.Provider)
+		if loadErr != nil {
+			releaseSlot()
+			if errors.Is(loadErr, repository.ErrNotFound) {
+				s.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: value.Provider, AccountID: value.ID})
+				return nil, errRoutingCredentialStale
+			}
+			return nil, fmt.Errorf("加载账号执行凭据: %w", loadErr)
+		}
+		hydrated, matched := material.ApplyTo(value)
+		if !matched {
+			releaseSlot()
+			s.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: value.Provider, AccountID: value.ID})
+			return nil, errRoutingCredentialStale
+		}
+		value = hydrated
+	}
+	s.selectionMu.Lock()
+	s.lastSelectedAt[value.ID] = time.Now().UTC()
+	s.selectionMu.Unlock()
+	return &accountLease{Credential: value, release: func() {
+		releaseSlot()
 	}}, nil
 }
 

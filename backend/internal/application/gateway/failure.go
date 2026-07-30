@@ -9,6 +9,9 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
 // UpstreamFailure 保存可安全暴露给下游和审计的上游失败分类，不包含响应正文或凭据。
@@ -20,14 +23,18 @@ type UpstreamFailure struct {
 	AccountID              uint64
 	AccountName            string
 	AccountScoped          bool
+	AccountBlocked         bool
 	PermanentAccountDenial bool
-	QuotaExhausted         bool
-	FreeQuotaExhausted     bool
-	ModelQuotaExhausted    bool
-	CredentialRejected     bool
-	Fingerprint            string
-	RetryAfter             time.Duration
-	Cause                  error
+	// SafetyRejection marks a request-level content safety denial. It must not
+	// refresh OAuth, retry, switch accounts, cool down, or invalidate credentials.
+	SafetyRejection     bool
+	QuotaExhausted      bool
+	FreeQuotaExhausted  bool
+	ModelQuotaExhausted bool
+	CredentialRejected  bool
+	Fingerprint         string
+	RetryAfter          time.Duration
+	Cause               error
 }
 
 func (e *UpstreamFailure) Error() string {
@@ -60,6 +67,29 @@ func (e *UpstreamFailure) AuditCode() string {
 	return truncateFailureCode(e.Code)
 }
 
+// ClientCredentialErrorCode 返回允许暴露给客户端的账号类上游错误码。
+// HTTP 状态和错误文案仍由传输层统一脱敏；这里只放行稳定、无凭据内容的机器码。
+func (e *UpstreamFailure) ClientCredentialErrorCode() string {
+	if e == nil {
+		return "upstream_unavailable"
+	}
+	return clientCredentialErrorCode(e.HTTPStatus, e.UpstreamCode)
+}
+
+// ClientCredentialErrorCodeFromBody 从账号类上游错误正文中提取允许公开的机器码。
+// 用于上游响应已直接交给传输层、尚未构造 UpstreamFailure 的路径。
+func ClientCredentialErrorCodeFromBody(status int, body []byte) string {
+	upstreamCode, _, _ := extractUpstreamErrorMetadata(body)
+	return clientCredentialErrorCode(status, upstreamCode)
+}
+
+func clientCredentialErrorCode(status int, upstreamCode string) string {
+	if status == http.StatusForbidden && normalizeFailureCode(upstreamCode) == "permission_denied" {
+		return "permission-denied"
+	}
+	return "upstream_unavailable"
+}
+
 func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountName string) *UpstreamFailure {
 	upstreamCode, upstreamType, upstreamMessage := extractUpstreamErrorMetadata(body)
 	failure := &UpstreamFailure{
@@ -76,26 +106,39 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 		failure.PublicMessage = "上游账号认证失败"
 		failure.AccountScoped = true
 		failure.CredentialRejected = true
+		failure.AccountBlocked = isDefinitiveAccountBlock(metadataText)
 	case http.StatusPaymentRequired:
 		failure.Code = "upstream_payment_required"
 		failure.PublicMessage = "上游账号额度不足"
 		failure.AccountScoped = true
 		failure.QuotaExhausted = true
+		// spending-limit is account-scoped, but its paid/free recovery kind depends on
+		// the selected account's billing snapshot and must be decided by the selector.
+		failure.FreeQuotaExhausted = isFreeQuotaExhaustion(metadataText)
 	case http.StatusForbidden:
 		failure.Code = "upstream_forbidden"
 		failure.PublicMessage = "上游拒绝了该请求"
-		failure.PermanentAccountDenial = isPermanentAccountDenial(metadataText)
+		// Safety denials are request-scoped: inspect both structured metadata and the raw body
+		// so SAFETY_CHECK_TYPE_* markers still match when they only appear in nested text.
+		if isSafetyRejection(metadataText) || isSafetyRejection(string(body)) {
+			failure.SafetyRejection = true
+			break
+		}
+		failure.AccountBlocked = isDefinitiveAccountBlock(metadataText)
+		failure.PermanentAccountDenial = isPermanentAccountDenial(upstreamMessage)
 		failure.ModelQuotaExhausted = isModelQuotaExhaustion(metadataText)
 		failure.FreeQuotaExhausted = failure.ModelQuotaExhausted || isFreeQuotaExhaustion(metadataText)
 		failure.QuotaExhausted = failure.FreeQuotaExhausted || isPaidQuotaExhaustion(metadataText)
 		failure.CredentialRejected = !failure.QuotaExhausted && containsAny(metadataText, "authentication", "unauthorized", "invalid token", "token expired")
-		failure.AccountScoped = failure.PermanentAccountDenial || failure.QuotaExhausted || failure.CredentialRejected || isAccountScopedForbidden(metadataText)
+		failure.AccountScoped = failure.AccountBlocked || failure.PermanentAccountDenial || failure.QuotaExhausted || failure.CredentialRejected || isAccountScopedForbidden(metadataText)
 	case http.StatusTooManyRequests:
 		failure.Code = "upstream_rate_limited"
 		failure.PublicMessage = "上游请求频率受限"
 		failure.AccountScoped = true
+		// Subscription-level free usage and explicit per-model free usage are
+		// distinct so the gateway can preserve their different recovery scopes.
+		failure.FreeQuotaExhausted = isFreeQuotaExhaustion(metadataText)
 		failure.ModelQuotaExhausted = isModelQuotaExhaustion(metadataText)
-		failure.FreeQuotaExhausted = failure.ModelQuotaExhausted || isFreeQuotaExhaustion(metadataText)
 		failure.QuotaExhausted = failure.FreeQuotaExhausted || isPaidQuotaExhaustion(metadataText)
 	default:
 		failure.Code = "upstream_server_error"
@@ -111,11 +154,14 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 
 func newTransportUpstreamFailure(err error, accountID uint64, accountName string) *UpstreamFailure {
 	code, message := "upstream_network_error", "连接上游服务失败"
-	if errors.Is(err, context.DeadlineExceeded) {
+	status := http.StatusBadGateway
+	if neterrorpkg.IsResponseHeaderTimeout(err) {
+		status, code, message = http.StatusGatewayTimeout, "upstream_header_timeout", "等待上游响应头超时"
+	} else if errors.Is(err, context.DeadlineExceeded) {
 		code, message = "upstream_timeout", "上游服务响应超时"
 	}
 	return &UpstreamFailure{
-		HTTPStatus: http.StatusBadGateway, Code: code, PublicMessage: message,
+		HTTPStatus: status, Code: code, PublicMessage: message,
 		AccountID: accountID, AccountName: accountName, Fingerprint: code, Cause: err,
 	}
 }
@@ -150,14 +196,32 @@ func extractUpstreamErrorMetadata(body []byte) (string, string, string) {
 }
 
 func isAccountScopedForbidden(text string) bool {
-	return containsAny(text, "quota", "billing", "subscription", "entitlement", "permission", "unauthorized", "authentication", "token", "usage-exhausted", "insufficient", "spending-limit")
+	// Do not match bare "permission" / permission-denied alone: those codes are shared by
+	// request-level policy denials. Account scope requires quota/billing/auth wording.
+	return containsAny(text, "quota", "billing", "subscription", "entitlement", "unauthorized", "authentication", "invalid token", "token expired", "usage-exhausted", "insufficient", "spending-limit")
 }
 
+// isPermanentAccountDenial requires explicit account/model permission text.
+// A bare permission-denied code without access-denied wording is not enough:
+// content safety rejections and other policy 403s share that code.
 func isPermanentAccountDenial(text string) bool {
-	if strings.Contains(text, "access to the chat endpoint is denied") {
-		return true
+	text = strings.ToLower(strings.Trim(strings.TrimSpace(text), " .!\t\r\n"))
+	return strings.Contains(text, "access to the chat endpoint is denied") || text == "access denied"
+}
+
+// isSafetyRejection identifies request-level content safety denials that must
+// be returned to the client without account rotation or invalidation.
+func isSafetyRejection(text string) bool {
+	if text == "" {
+		return false
 	}
-	return strings.Trim(strings.TrimSpace(text), " .!\t\r\n") == "access denied"
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "content violates usage guidelines") ||
+		strings.Contains(lower, "safety_check_type_")
+}
+
+func isDefinitiveAccountBlock(text string) bool {
+	return provider.IsDefinitiveAccountBlockText(text)
 }
 
 func isPaidQuotaExhaustion(text string) bool {

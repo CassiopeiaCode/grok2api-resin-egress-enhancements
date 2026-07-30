@@ -2,6 +2,35 @@ package repository
 
 import "time"
 
+const (
+	// DefaultPageSize is the default size for admin list endpoints.
+	DefaultPageSize = 20
+	// MaxPageSize bounds an individual admin query. It is intentionally finite
+	// so large page requests cannot turn into unbounded database or JSON work.
+	MaxPageSize = 2000
+	// DefaultCursorPageSize is the default batch size for cursor-based audit reads.
+	DefaultCursorPageSize = 50
+)
+
+// NormalizePage applies the common bounded pagination contract used by all
+// admin list endpoints. Keeping this in one place prevents transport and
+// application layers from returning different effective page sizes.
+func NormalizePage(page, pageSize, defaultPageSize int) (int, int) {
+	if page < 1 {
+		page = 1
+	}
+	if defaultPageSize < 1 || defaultPageSize > MaxPageSize {
+		defaultPageSize = DefaultPageSize
+	}
+	if pageSize < 1 {
+		pageSize = defaultPageSize
+	}
+	if pageSize > MaxPageSize {
+		pageSize = MaxPageSize
+	}
+	return page, pageSize
+}
+
 type SortDirection string
 
 const (
@@ -42,7 +71,18 @@ type AccountListFilter struct {
 	Provider    string
 	QuotaType   string
 	Status      string
+	Egress      string
 	Refreshable *bool
+	// Agreement filters grok_web accounts by NSFW and current terms acceptance.
+	Agreement string
+	// Association filters accounts by link-table bindings: grok_web supports
+	// build/console/all values; grok_build and grok_console support webLinked/webUnlinked.
+	Association string
+	AccountIDs  []uint64
+	RestrictIDs bool
+	ExcludeIDs  []uint64
+	AfterID     uint64
+	ThroughID   uint64
 	Now         time.Time
 }
 
@@ -63,8 +103,11 @@ type AccountSummary struct {
 }
 
 type ModelListFilter struct {
-	Provider string
-	Enabled  *bool
+	Provider    string
+	Providers   []string
+	Tiers       []string
+	Enabled     *bool
+	ActiveScope bool
 }
 
 type ModelListQuery struct {

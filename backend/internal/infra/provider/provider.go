@@ -19,15 +19,16 @@ var (
 	ErrAuthorizationDenied  = errors.New("authorization denied")
 	ErrCredentialLimit      = errors.New("credential count exceeds limit")
 	ErrUnauthorized         = errors.New("upstream credential unauthorized")
+	ErrBirthDateAlreadySet  = errors.New("upstream birth date is already set")
 )
 
-// HTTPStatusError 允许流式或异步 Provider 在无法返回 Response 时保留上游状态码。
+// HTTPStatusError preserves the upstream status when a streaming or asynchronous Provider cannot return a Response.
 type HTTPStatusError interface {
 	error
 	HTTPStatusCode() int
 }
 
-// ErrorHTTPStatus 从 Provider 错误链中提取上游 HTTP 状态。
+// ErrorHTTPStatus extracts the upstream HTTP status from a Provider error chain.
 func ErrorHTTPStatus(err error) (int, bool) {
 	var statusError HTTPStatusError
 	if !errors.As(err, &statusError) {
@@ -37,7 +38,7 @@ func ErrorHTTPStatus(err error) (int, bool) {
 	return status, status > 0
 }
 
-// MediaPostProcessingStage 标识媒体已经生成后失败的本地处理阶段。
+// MediaPostProcessingStage identifies a local processing stage that failed after media generation.
 type MediaPostProcessingStage string
 
 const (
@@ -45,8 +46,8 @@ const (
 	MediaPostProcessingStorage  MediaPostProcessingStage = "storage"
 )
 
-// MediaPostProcessingError 表示上游媒体已经产生，后续下载或保存失败。
-// 此类错误不得触发换号重新生成，也不应降低生成账号的健康度。
+// MediaPostProcessingError indicates that upstream media was created but download or storage failed.
+// These errors must not trigger generation on another account or reduce the generating account's health.
 type MediaPostProcessingError struct {
 	Stage MediaPostProcessingStage
 	Cause error
@@ -66,7 +67,7 @@ func (e *MediaPostProcessingError) Unwrap() error {
 	return e.Cause
 }
 
-// NewMediaPostProcessingError 将下载或保存错误标记为不可跨账号重试。
+// NewMediaPostProcessingError marks a download or storage error as non-retryable across accounts.
 func NewMediaPostProcessingError(stage MediaPostProcessingStage, cause error) error {
 	if cause == nil {
 		return nil
@@ -74,16 +75,20 @@ func NewMediaPostProcessingError(stage MediaPostProcessingStage, cause error) er
 	return &MediaPostProcessingError{Stage: stage, Cause: cause}
 }
 
-// IsMediaPostProcessingError 判断错误是否发生在媒体生成后的本地处理阶段。
+// IsMediaPostProcessingError reports whether an error occurred during local processing after media generation.
 func IsMediaPostProcessingError(err error) bool {
 	var target *MediaPostProcessingError
 	return errors.As(err, &target)
 }
 
-// CredentialRefreshError 区分需要重新认证的永久 OAuth 错误与可后台退避重试的临时错误。
+// CredentialRefreshError distinguishes permanent OAuth errors requiring reauthorization from temporary errors that can retry with backoff.
 type CredentialRefreshError struct {
-	Status     int
-	Code       string
+	Status  int
+	Code    string
+	Message string
+	// Response is a bounded, redacted representation of the upstream OAuth
+	// response. It is diagnostic only and must never contain credentials.
+	Response   string
 	Permanent  bool
 	RetryAfter time.Duration
 	Cause      error
@@ -94,7 +99,13 @@ func (e *CredentialRefreshError) Error() string {
 		return "credential refresh failed"
 	}
 	if e.Code != "" {
+		if e.Message != "" {
+			return "credential refresh failed: " + e.Code + ": " + e.Message
+		}
 		return "credential refresh failed: " + e.Code
+	}
+	if e.Message != "" {
+		return "credential refresh failed: " + e.Message
 	}
 	if e.Cause != nil {
 		return "credential refresh failed: " + e.Cause.Error()
@@ -109,21 +120,30 @@ func (e *CredentialRefreshError) Unwrap() error {
 	return e.Cause
 }
 
-// ResponseResourceRequest 表示对 Responses 资源端点的通用上游请求。
+// ResponseResourceRequest describes a common upstream request to a Responses resource endpoint.
 type ResponseResourceRequest struct {
-	Credential     account.Credential
+	Credential account.Credential
+	// Billing is used only to determine XAI eligibility in Build auto mode; nil means the account tier is unknown.
+	Billing        *account.Billing
 	Method         string
 	Path           string
 	Body           []byte
 	Model          string
 	PromptCacheKey string
-	IdempotencyID  string
-	Streaming      bool
-	NormalizeBody  bool
-	Operation      string
+	// ReasoningReplayKey comes only from explicit client session identity; soft cache identity must not replay ciphertext.
+	ReasoningReplayKey string
+	// AllowClientToolCacheRoute allows the Build native cache route to supplement existing client tools.
+	// This is a protocol compatibility signal, not a client authentication result.
+	AllowClientToolCacheRoute bool
+	// GrokTurnIndex is the explicit Grok Shell client turn; it is validated before Build egress and never fabricated by the server.
+	GrokTurnIndex string
+	IdempotencyID string
+	Streaming     bool
+	NormalizeBody bool
+	Operation     string
 }
 
-// Response 表示尚未写入下游的上游响应。
+// Response represents an upstream response that has not yet been written downstream.
 type Response struct {
 	StatusCode  int
 	Status      string
@@ -132,9 +152,11 @@ type Response struct {
 	QuotaUnits  int
 	UpstreamURL string
 	Diagnostic  *DiagnosticResponse
-	RateLimit   *RateLimitMetadata
-	// ModelCatalogChanged 表示上游推理响应中的模型目录 ETag 与该账号
-	// 最近一次成功 /models 同步的 ETag 不一致。
+	// RecoveredPrimaryFailure records a primary-plane failure hidden by a successful Provider fallback.
+	RecoveredPrimaryFailure *DiagnosticResponse
+	RateLimit               *RateLimitMetadata
+	// ModelCatalogChanged indicates that the model catalog ETag in an inference response differs from
+	// the ETag from the account's most recent successful /models sync.
 	ModelCatalogChanged bool
 }
 
@@ -143,7 +165,7 @@ const (
 	RateLimitScopeRPM = "rpm"
 )
 
-// RateLimitMetadata 表示上游返回的可安全传播的瞬时限流元数据。
+// RateLimitMetadata contains transient rate-limit metadata that is safe to propagate from upstream.
 type RateLimitMetadata struct {
 	Scope      string
 	TeamID     string
@@ -155,7 +177,7 @@ type RateLimitMetadata struct {
 
 const MaxDiagnosticBodyBytes = 64 << 10
 
-// DiagnosticResponse 保留 Provider 转换前经过容量限制的失败响应。
+// DiagnosticResponse retains a size-limited failure response before Provider conversion.
 type DiagnosticResponse struct {
 	StatusCode    int
 	Status        string
@@ -164,7 +186,7 @@ type DiagnosticResponse struct {
 	BodyTruncated bool
 }
 
-// ReadDiagnosticBody 最多读取诊断正文上限，并报告上游是否还有未保留内容。
+// ReadDiagnosticBody reads up to the diagnostic body limit and reports whether upstream content was truncated.
 func ReadDiagnosticBody(body io.Reader) ([]byte, bool, error) {
 	if body == nil {
 		return nil, false, nil
@@ -176,7 +198,7 @@ func ReadDiagnosticBody(body io.Reader) ([]byte, bool, error) {
 	return data[:MaxDiagnosticBodyBytes], true, err
 }
 
-// DeviceAuthorization 表示 Device OAuth 启动结果。
+// DeviceAuthorization represents the result of starting Device OAuth.
 type DeviceAuthorization struct {
 	DeviceCode              string
 	UserCode                string
@@ -186,21 +208,25 @@ type DeviceAuthorization struct {
 	ExpiresIn               time.Duration
 }
 
-// CredentialSeed 表示登录或导入后尚未持久化的 OAuth 凭据。
+// CredentialSeed represents an OAuth credential not yet persisted after login or import.
 type CredentialSeed struct {
-	Provider          account.Provider
-	AuthType          account.AuthType
-	WebTier           account.WebTier
-	Name              string
-	Email             string
-	UserID            string
-	TeamID            string
-	SourceKey         string
-	OIDCClientID      string
-	AccessToken       string
-	RefreshToken      string
-	CloudflareCookies string
-	ExpiresAt         time.Time
+	Provider                account.Provider
+	AuthType                account.AuthType
+	WebTier                 account.WebTier
+	Name                    string
+	Email                   string
+	UserID                  string
+	TeamID                  string
+	SourceKey               string
+	OIDCClientID            string
+	AccessToken             string
+	RefreshToken            string
+	CloudflareCookies       string
+	ExpiresAt               time.Time
+	WebNSFWEnabledAt        *time.Time
+	WebTermsAcceptedAt      *time.Time
+	WebTermsAcceptedVersion int
+	WebBirthDateSetAt       *time.Time
 }
 
 type QuotaSnapshot struct {
@@ -219,6 +245,7 @@ type ImageGenerationRequest struct {
 	Resolution     string
 	ResponseFormat string
 	Streaming      bool
+	PartialImages  int
 }
 
 type ImageInput struct {
@@ -233,12 +260,20 @@ type ImageEditRequest struct {
 	Prompt         string
 	ImageURLs      []string
 	Count          int
+	Size           string
+	AspectRatio    string
 	Resolution     string
 	ResponseFormat string
+	Streaming      bool
+	PartialImages  int
 }
 
 type VideoRequest struct {
-	Credential    account.Credential
+	Credential account.Credential
+	// Billing is used only to determine XAI eligibility in Build auto mode; nil means the account tier is unknown.
+	Billing *account.Billing
+	// JobID binds the local video job to XAI ZDR upload tickets and result assets.
+	JobID         string
 	Prompt        string
 	Duration      int
 	AspectRatio   string
@@ -250,16 +285,18 @@ type VideoRequest struct {
 type VideoResult struct {
 	URL         string
 	ContentType string
+	// A non-empty AssetID means the result is stored as a local media asset; content reads must use MediaObjectStorage.
+	AssetID string
 }
 
-// RefreshedCredential 表示 OAuth 刷新后的旋转凭据。
+// RefreshedCredential represents rotated credentials returned by an OAuth refresh.
 type RefreshedCredential struct {
 	EncryptedAccessToken  string
 	EncryptedRefreshToken string
 	ExpiresAt             time.Time
 }
 
-// Adapter 只定义 Provider 身份；具体能力通过小接口按需注册。
+// Adapter defines only Provider identity; concrete capabilities are registered through small interfaces as needed.
 type Adapter interface {
 	Provider() account.Provider
 }
@@ -272,6 +309,14 @@ type ResponseAdapter interface {
 type ModelCatalogAdapter interface {
 	Adapter
 	ListModels(ctx context.Context, credential account.Credential) ([]string, error)
+}
+
+// AccountModelCapabilityNormalizer is optional and normalizes account model capabilities from Billing and credential entitlement.
+// Without it, model sync writes the upstream catalog unchanged; nil billing means Unknown with no snapshot.
+// credential is used for Build Super entitlement; default Providers may ignore it.
+type AccountModelCapabilityNormalizer interface {
+	Adapter
+	NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string
 }
 
 type BillingAdapter interface {
@@ -296,6 +341,30 @@ type CredentialCodecAdapter interface {
 	MarshalCredentials(values []CredentialSeed) ([]byte, error)
 }
 
+// CredentialMetadata contains non-sensitive display data safely derived from a stored credential.
+// Raw tokens and complete JWT claims must never be exposed through this structure.
+type CredentialMetadata struct {
+	BuildBotFlagged bool
+}
+
+type CredentialMetadataAdapter interface {
+	Adapter
+	CredentialMetadata(credential account.Credential) CredentialMetadata
+}
+
+// AccountIdentity contains non-sensitive account identity metadata confirmed by upstream.
+// Email is for display only; cross-Provider automatic linking uses stable UserID only.
+type AccountIdentity struct {
+	Email  string
+	UserID string
+	TeamID string
+}
+
+type AccountIdentityAdapter interface {
+	Adapter
+	SyncAccountIdentity(ctx context.Context, credential account.Credential) (AccountIdentity, error)
+}
+
 type BuildCredentialConverter interface {
 	Adapter
 	ConvertToBuild(ctx context.Context, credential account.Credential) (CredentialSeed, error)
@@ -307,19 +376,28 @@ type QuotaAdapter interface {
 	SyncQuotaMode(ctx context.Context, credential account.Credential, mode string) (account.QuotaWindow, error)
 }
 
-// ImageGenerationAdapter 定义 Provider 可选的图片生成能力。
+// WebAccountSettingsAdapter defines upstream profile-setting capabilities for Grok Web SSO accounts.
+// This capability belongs only to the Web Provider; Build and Console must not emulate it through generic account logic.
+type WebAccountSettingsAdapter interface {
+	Adapter
+	AcceptTerms(ctx context.Context, credential account.Credential) error
+	SetBirthDate(ctx context.Context, credential account.Credential, birthDate time.Time) error
+	EnableNSFW(ctx context.Context, credential account.Credential) error
+}
+
+// ImageGenerationAdapter defines an optional Provider image-generation capability.
 type ImageGenerationAdapter interface {
 	Adapter
 	GenerateImage(ctx context.Context, request ImageGenerationRequest) (*Response, error)
 }
 
-// ImageEditAdapter 定义 Provider 可选的图片编辑能力。
+// ImageEditAdapter defines an optional Provider image-editing capability.
 type ImageEditAdapter interface {
 	Adapter
 	EditImage(ctx context.Context, request ImageEditRequest) (*Response, error)
 }
 
-// ImageAssetStore 将生成图片归档为可由后端稳定读取的本地资源。
+// ImageAssetStore archives generated images as local resources that the backend can read reliably.
 type ImageAssetStore interface {
 	SaveImage(ctx context.Context, data []byte) (media.Asset, error)
 	PublicImageURL(id string) string
@@ -330,13 +408,20 @@ type VideoAdapter interface {
 	GenerateVideo(ctx context.Context, request VideoRequest) (VideoResult, error)
 }
 
+// VideoContentDownloader reads completed video content using the credential that created the task.
+// Callers must verify task ownership first.
+type VideoContentDownloader interface {
+	VideoAdapter
+	DownloadVideo(ctx context.Context, credential account.Credential, rawURL string) (io.ReadCloser, string, int64, error)
+}
+
 type RoutingMetadataAdapter interface {
 	Adapter
 	QuotaMode(upstreamModel string) string
 	TierOrder(upstreamModel string) []account.WebTier
 }
 
-// ModelAlias 将隐藏兼容模型名解析到唯一公开路由，并可固定推理强度。
+// ModelAlias resolves a hidden compatibility model name to one public route and can fix reasoning effort.
 type ModelAlias struct {
 	Alias           string
 	PublicModel     string
@@ -350,13 +435,13 @@ type ModelAliasAdapter interface {
 	ModelAliases() []ModelAlias
 }
 
-// PricingMetadataAdapter 将 Provider 私有模型标识映射到公开计费模型。
+// PricingMetadataAdapter maps Provider-private model identifiers to public billing models.
 type PricingMetadataAdapter interface {
 	Adapter
 	PricingModel(upstreamModel string) string
 }
 
-// Registry 保存已启用 Provider Adapter，不创建未实现来源的占位对象。
+// Registry stores enabled Provider Adapters and does not create placeholders for unsupported sources.
 type Registry struct {
 	adapters    map[account.Provider]Adapter
 	definitions map[account.Provider]Definition
@@ -414,25 +499,25 @@ func NewRegistry(adapters ...Adapter) *Registry {
 	return registry
 }
 
-// Get 返回已注册的 Provider Adapter。
+// Get returns a registered Provider Adapter.
 func (r *Registry) Get(value account.Provider) (Adapter, bool) {
 	adapter, ok := r.adapters[value]
 	return adapter, ok
 }
 
-// ResolveModelAlias 返回隐藏兼容模型名对应的规范内部路由。
+// ResolveModelAlias returns the canonical internal route for a hidden compatibility model name.
 func (r *Registry) ResolveModelAlias(value string) (ModelAlias, bool) {
 	result, ok := r.aliases[value]
 	return result, ok
 }
 
-// Definition 返回生产 Adapter 声明的稳定能力描述。
+// Definition returns the stable capability declaration from a production Adapter.
 func (r *Registry) Definition(value account.Provider) (Definition, bool) {
 	definition, ok := r.definitions[value]
 	return definition.Clone(), ok
 }
 
-// Providers 返回按固定渠道顺序注册且具备能力描述的 Provider。
+// Providers returns registered Providers in fixed channel order with capability definitions.
 func (r *Registry) Providers() []account.Provider {
 	values := make([]account.Provider, 0, len(r.definitions))
 	for _, value := range account.Providers() {
@@ -443,7 +528,7 @@ func (r *Registry) Providers() []account.Provider {
 	return values
 }
 
-// Validate 检查生产注册表的定义与实际小接口实现是否一致。
+// Validate checks that production registry definitions match their implemented capability interfaces.
 func (r *Registry) Validate() error {
 	if r == nil {
 		return errors.New("Provider Registry 不能为空")
@@ -610,6 +695,31 @@ func (r *Registry) CredentialCodec(value account.Provider) (CredentialCodecAdapt
 	return result, ok
 }
 
+// CredentialMetadata returns derived credential metadata safe for admin display.
+func (r *Registry) CredentialMetadata(credential account.Credential) CredentialMetadata {
+	if r == nil {
+		return CredentialMetadata{}
+	}
+	adapter, ok := r.adapters[credential.Provider]
+	if !ok {
+		return CredentialMetadata{}
+	}
+	inspector, ok := adapter.(CredentialMetadataAdapter)
+	if !ok {
+		return CredentialMetadata{}
+	}
+	return inspector.CredentialMetadata(credential)
+}
+
+func (r *Registry) AccountIdentity(value account.Provider) (AccountIdentityAdapter, bool) {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(AccountIdentityAdapter)
+	return result, ok
+}
+
 func (r *Registry) BuildConverter(value account.Provider) (BuildCredentialConverter, bool) {
 	adapter, ok := r.Get(value)
 	if !ok {
@@ -625,6 +735,16 @@ func (r *Registry) Quota(value account.Provider) (QuotaAdapter, bool) {
 		return nil, false
 	}
 	result, ok := adapter.(QuotaAdapter)
+	return result, ok
+}
+
+// WebAccountSettings returns the Grok Web-specific account profile settings capability.
+func (r *Registry) WebAccountSettings() (WebAccountSettingsAdapter, bool) {
+	adapter, ok := r.Get(account.ProviderWeb)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(WebAccountSettingsAdapter)
 	return result, ok
 }
 
@@ -667,7 +787,7 @@ func (r *Registry) PricingModel(value account.Provider, upstreamModel string) st
 	return upstreamModel
 }
 
-// ImageGeneration 返回 Provider 注册的图片生成能力。
+// ImageGeneration returns the image-generation capability registered by the Provider.
 func (r *Registry) ImageGeneration(value account.Provider) (ImageGenerationAdapter, bool) {
 	adapter, ok := r.Get(value)
 	if !ok {
@@ -677,7 +797,7 @@ func (r *Registry) ImageGeneration(value account.Provider) (ImageGenerationAdapt
 	return result, ok
 }
 
-// ImageEdit 返回 Provider 注册的图片编辑能力。
+// ImageEdit returns the image-editing capability registered by the Provider.
 func (r *Registry) ImageEdit(value account.Provider) (ImageEditAdapter, bool) {
 	adapter, ok := r.Get(value)
 	if !ok {

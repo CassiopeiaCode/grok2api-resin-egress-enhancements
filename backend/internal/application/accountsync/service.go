@@ -45,6 +45,10 @@ type quotaSynchronizer interface {
 	RefreshQuota(ctx context.Context, accountID uint64) ([]accountdomain.QuotaWindow, error)
 }
 
+type identitySynchronizer interface {
+	SyncAccountIdentity(ctx context.Context, accountID uint64) error
+}
+
 // Service 对新接入账号执行一次性额度与模型补齐，并限制批量同步并发。
 type Service struct {
 	logger   *slog.Logger
@@ -75,6 +79,24 @@ func (s *Service) UpdateConcurrency(value int) {
 	}
 	s.workers.Store(int64(value))
 	s.bulkPool.UpdateLimit(value)
+}
+
+// SyncModels 强制刷新指定账号的模型能力，不受初始同步快照跳过规则影响。
+func (s *Service) SyncModels(ctx context.Context, accountID uint64) error {
+	if accountID == 0 {
+		return errors.New("账号 ID 无效")
+	}
+	if s.models == nil {
+		return errors.New("模型同步器未初始化")
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, operationTimeout)
+	defer cancel()
+	_, err := s.models.SyncAccount(operationCtx, accountID)
+	if err != nil {
+		s.logger.Warn("account_model_sync_failed", "account_id", accountID, "error", err)
+		return fmt.Errorf("同步模型: %w", err)
+	}
+	return nil
 }
 
 // Result 汇总本次初始同步成功与失败的账号数。
@@ -173,6 +195,7 @@ sendLoop:
 
 func (s *Service) syncAccount(ctx context.Context, accountID uint64) error {
 	var syncErr error
+	billingSnapshotCreated := false
 	view, err := s.accounts.Get(ctx, accountID)
 	if err != nil {
 		return fmt.Errorf("读取账号: %w", err)
@@ -184,6 +207,19 @@ func (s *Service) syncAccount(ctx context.Context, accountID uint64) error {
 	definition, ok := policy.ProviderDefinition(view.Credential.Provider)
 	if !ok {
 		return fmt.Errorf("Provider %s 未注册生命周期策略", view.Credential.Provider)
+	}
+	if view.Credential.Provider == accountdomain.ProviderWeb || view.Credential.Provider == accountdomain.ProviderConsole {
+		if identity, ok := s.accounts.(identitySynchronizer); ok {
+			operationCtx, cancel := context.WithTimeout(ctx, operationTimeout)
+			identityErr := identity.SyncAccountIdentity(operationCtx, accountID)
+			if identityErr != nil {
+				s.logger.Warn("account_initial_identity_sync_failed", "account_id", accountID, "error", identityErr)
+			}
+			cancel()
+			if errors.Is(identityErr, provider.ErrUnauthorized) {
+				return fmt.Errorf("同步账号身份: %w", identityErr)
+			}
+		}
 	}
 	if definition.Quota == provider.QuotaRemoteWindow || definition.Quota == provider.QuotaLocalWindow {
 		hasQuota, quotaErr := s.quota.HasQuotaWindows(ctx, accountID)
@@ -209,6 +245,8 @@ func (s *Service) syncAccount(ctx context.Context, accountID uint64) error {
 			if err != nil {
 				s.logger.Warn("account_initial_billing_sync_failed", "account_id", accountID, "error", err)
 				syncErr = errors.Join(syncErr, fmt.Errorf("同步额度: %w", err))
+			} else {
+				billingSnapshotCreated = true
 			}
 		}
 	}
@@ -218,7 +256,7 @@ func (s *Service) syncAccount(ctx context.Context, accountID uint64) error {
 		s.logger.Warn("account_initial_model_check_failed", "account_id", accountID, "error", err)
 		return errors.Join(syncErr, fmt.Errorf("检查模型快照: %w", err))
 	}
-	if hasModels {
+	if hasModels && !billingSnapshotCreated {
 		return syncErr
 	}
 	operationCtx, cancel := context.WithTimeout(ctx, operationTimeout)

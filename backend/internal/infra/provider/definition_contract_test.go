@@ -46,9 +46,10 @@ func TestProductionProviderDefinitionsMatchImplementedCapabilities(t *testing.T)
 	}{
 		{
 			provider: account.ProviderBuild, catalog: provider.ModelCatalogRemote, quota: provider.QuotaBilling,
-			capabilities: []modeldomain.Capability{modeldomain.CapabilityResponses},
+			capabilities: []modeldomain.Capability{modeldomain.CapabilityResponses, modeldomain.CapabilityVideo},
 			credential:   provider.CredentialSurface{AuthType: account.AuthTypeOAuth, Import: true, Refresh: true, DeviceOAuth: true},
 			conversation: provider.ConversationSurface{Responses: true, ChatCompletions: true, Messages: true, Compact: true, StoredResponses: true},
+			media:        provider.MediaSurface{VideoGeneration: true},
 			inference:    provider.InferencePolicy{Usage: provider.UsageUpstream},
 		},
 		{
@@ -88,6 +89,9 @@ func TestProductionProviderDefinitionsMatchImplementedCapabilities(t *testing.T)
 	}
 	if !registry.SupportsResponseCompaction(account.ProviderBuild) || registry.SupportsResponseCompaction(account.ProviderWeb) || registry.SupportsResponseCompaction(account.ProviderConsole) {
 		t.Fatal("response compaction capability boundary is inconsistent")
+	}
+	if !registry.SupportsConversation(account.ProviderBuild, "compaction") || registry.SupportsConversation(account.ProviderWeb, "compaction") || registry.SupportsConversation(account.ProviderConsole, "compaction") {
+		t.Fatal("compaction operation capability boundary is inconsistent")
 	}
 	definition, _ := registry.Definition(account.ProviderWeb)
 	definition.ModelCapabilities[0] = modeldomain.CapabilityResponses

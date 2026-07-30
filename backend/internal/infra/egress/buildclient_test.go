@@ -10,7 +10,59 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
+
+func TestBuildClientUsesConfiguredResponseHeaderTimeout(t *testing.T) {
+	client, err := newBuildClient("", 7*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := client.Transport.(*http.Transport)
+	if transport.ResponseHeaderTimeout != 7*time.Minute {
+		t.Fatalf("response header timeout = %s", transport.ResponseHeaderTimeout)
+	}
+}
+
+func TestBuildClientResponseHeaderTimeoutDoesNotLimitResponseBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		time.Sleep(200 * time.Millisecond)
+		_, _ = io.WriteString(writer, "ok")
+	}))
+	defer server.Close()
+	client, err := newBuildClient("", 100*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil || string(body) != "ok" {
+		t.Fatalf("body=%q err=%v", body, err)
+	}
+}
+
+func TestBuildClientClassifiesDelayedResponseHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client, err := newBuildClient("", 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Get(server.URL)
+	if !neterrorpkg.IsResponseHeaderTimeout(err) {
+		t.Fatalf("error = %v", err)
+	}
+}
 
 func TestNewBuildClientUsesStandardTransportForEveryProxyFamily(t *testing.T) {
 	tests := []struct {
@@ -28,7 +80,7 @@ func TestNewBuildClientUsesStandardTransportForEveryProxyFamily(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			client, err := newBuildClient(test.proxyURL)
+			client, err := newBuildClient(test.proxyURL, 5*time.Minute)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -47,14 +99,14 @@ func TestNewBuildClientUsesStandardTransportForEveryProxyFamily(t *testing.T) {
 }
 
 func TestNewBuildClientRejectsUnsupportedProxyScheme(t *testing.T) {
-	if _, err := newBuildClient("ftp://proxy.example:21"); err == nil {
+	if _, err := newBuildClient("ftp://proxy.example:21", 5*time.Minute); err == nil {
 		t.Fatal("unsupported proxy scheme was accepted")
 	}
 }
 
 func TestBuildClientRoutesThroughSOCKS5HWithRemoteDNS(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("User-Agent") != "grok-shell/0.2.101 (linux; x86_64)" {
+		if request.Header.Get("User-Agent") != "grok-shell/0.2.102 (linux; x86_64)" {
 			t.Errorf("User-Agent = %q", request.Header.Get("User-Agent"))
 		}
 		writer.Header().Set("Connection", "close")
@@ -75,7 +127,7 @@ func TestBuildClientRoutesThroughSOCKS5HWithRemoteDNS(t *testing.T) {
 	proxyDone := make(chan error, 1)
 	go func() { proxyDone <- serveSOCKS5TunnelOnce(listener, upstreamAddress, requestedHost) }()
 
-	client, err := newBuildClient("socks5h://" + listener.Addr().String())
+	client, err := newBuildClient("socks5h://"+listener.Addr().String(), 5*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +136,7 @@ func TestBuildClientRoutesThroughSOCKS5HWithRemoteDNS(t *testing.T) {
 		t.Fatal(err)
 	}
 	request.Close = true
-	request.Header.Set("User-Agent", "grok-shell/0.2.101 (linux; x86_64)")
+	request.Header.Set("User-Agent", "grok-shell/0.2.102 (linux; x86_64)")
 	response, err := client.Do(request)
 	if err != nil {
 		t.Fatal(err)

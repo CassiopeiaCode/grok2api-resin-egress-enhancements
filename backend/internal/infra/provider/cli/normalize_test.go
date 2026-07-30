@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func TestNormalizeResponsesRequest(t *testing.T) {
 		t.Fatalf("模型或缓存键未正确改写: %#v", payload)
 	}
 	input := payload["input"].([]any)
-	if len(input) != 2 || input[0].(map[string]any)["encrypted_content"] != "cipher" {
+	if len(input) != 2 || input[0].(map[string]any)["type"] != "reasoning" || input[0].(map[string]any)["encrypted_content"] != "cipher" {
 		t.Fatalf("reasoning 回放项未保留: %#v", input)
 	}
 	reasoningContent := input[0].(map[string]any)["content"].([]any)[0].(map[string]any)
@@ -34,6 +35,37 @@ func TestNormalizeResponsesRequest(t *testing.T) {
 	text := payload["text"].(map[string]any)
 	if text["format"] == nil || payload["response_format"] != nil {
 		t.Fatalf("response_format 未映射: %#v", payload)
+	}
+}
+
+func TestNormalizeBuildReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name   string
+		effort string
+		want   string
+	}{
+		{name: "max", effort: "max", want: "high"},
+		{name: "xhigh", effort: "xhigh", want: "high"},
+		{name: "uppercase max", effort: "MAX", want: "high"},
+		{name: "high", effort: "high", want: "high"},
+		{name: "medium", effort: "medium", want: "medium"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"reasoning":{"effort":"` + test.effort + `"},"input":"hello"}`)
+			normalized, err := normalizeBuildReasoningEffort(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(normalized, &payload); err != nil {
+				t.Fatal(err)
+			}
+			reasoning, ok := payload["reasoning"].(map[string]any)
+			if !ok || reasoning["effort"] != test.want {
+				t.Fatalf("reasoning = %#v, want %q", payload["reasoning"], test.want)
+			}
+		})
 	}
 }
 
@@ -62,6 +94,23 @@ func TestNormalizeResponsesRequestDoesNotInventPromptCacheKey(t *testing.T) {
 	}
 	if _, exists := payload["prompt_cache_key"]; exists {
 		t.Fatalf("unexpected prompt_cache_key: %#v", payload)
+	}
+}
+
+func TestNormalizeResponsesRequestAddsEmptySummaryToEncryptedReasoning(t *testing.T) {
+	normalized, _, err := normalizeResponsesRequest([]byte(`{"model":"public","input":[{"type":"reasoning","encrypted_content":"opaque"},{"role":"user","content":"continue"}]}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Input []map[string]any `json:"input"`
+	}
+	if json.Unmarshal(normalized, &payload) != nil || len(payload.Input) != 2 {
+		t.Fatalf("normalized = %s", normalized)
+	}
+	summary, ok := payload.Input[0]["summary"].([]any)
+	if !ok || len(summary) != 0 || payload.Input[0]["encrypted_content"] != "opaque" {
+		t.Fatalf("reasoning = %#v", payload.Input[0])
 	}
 }
 
@@ -95,6 +144,39 @@ func TestParseImportedCredentialsBatch(t *testing.T) {
 	}
 	if values[0].SourceKey == values[1].SourceKey {
 		t.Fatal("不同账号生成了相同来源标识")
+	}
+}
+
+func TestParseImportedCredentialsJSONSequence(t *testing.T) {
+	data := []byte("\xef\xbb\xbf{\n  \"access_token\": \"access-1\",\n  \"sub\": \"user-1\"\n}\r\n\r\n" +
+		"{\"refresh_token\":\"refresh-2\",\"email\":\"two@example.com\"}\r\n")
+	values, err := parseImportedCredentials(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 2 || values[0].AccessToken != "access-1" || values[0].UserID != "user-1" || values[1].RefreshToken != "refresh-2" {
+		t.Fatalf("JSON sequence import = %#v", values)
+	}
+}
+
+func TestParseImportedCredentialsLooseAccountsDocument(t *testing.T) {
+	data := []byte("{\n  \"accounts\": [\n" +
+		"{\"access_token\":\"access-1\",\"sub\":\"user-1\"}\n" +
+		"{\"refresh_token\":\"refresh-2\"}\n")
+	values, err := parseImportedCredentials(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 2 || values[0].UserID != "user-1" || values[1].RefreshToken != "refresh-2" {
+		t.Fatalf("loose accounts import = %#v", values)
+	}
+}
+
+func TestParseImportedCredentialsLooseAccountsDocumentReportsLine(t *testing.T) {
+	data := []byte("{\n  \"accounts\": [\n{\"access_token\":\"access-1\"}\nnot-json\n")
+	_, err := parseImportedCredentials(data)
+	if err == nil || !strings.Contains(err.Error(), "第 4 行") {
+		t.Fatalf("error = %v, want line number", err)
 	}
 }
 

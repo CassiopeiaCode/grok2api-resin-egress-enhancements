@@ -21,16 +21,20 @@ import (
 )
 
 var (
-	ErrAssetNotFound        = errors.New("媒体资源不存在")
-	ErrInvalidImage         = errors.New("图片内容无效")
-	ErrInvalidFilter        = errors.New("媒体筛选条件无效")
-	ErrMediaJobsUnavailable = errors.New("视频任务仓储未配置")
+	ErrAssetNotFound         = errors.New("媒体资源不存在")
+	ErrInvalidImage          = errors.New("图片内容无效")
+	ErrInvalidImageSelection = errors.New("图片选择无效")
+	ErrInvalidVideoSelection = errors.New("视频任务选择无效")
+	ErrActiveVideoSelection  = errors.New("排队中或生成中的视频任务不能删除")
+	ErrInvalidFilter         = errors.New("媒体筛选条件无效")
+	ErrMediaJobsUnavailable  = errors.New("视频任务仓储未配置")
 )
 
-// Service 负责图片校验、文件落盘和元数据持久化的一致性收口。
+// Service 负责图片/视频校验、文件落盘和元数据持久化的一致性收口。
 type Service struct {
 	assets        repository.MediaAssetRepository
 	jobs          repository.MediaJobRepository
+	tickets       repository.MediaUploadTicketRepository
 	objects       repository.MediaObjectStorage
 	cleanupLock   repository.DistributedLock
 	publicBaseURL string
@@ -66,8 +70,13 @@ type VideoStats struct {
 }
 
 func NewService(assets repository.MediaAssetRepository, jobs repository.MediaJobRepository, objects repository.MediaObjectStorage, cleanupLock repository.DistributedLock, cfg Config) *Service {
+	return NewServiceWithTickets(assets, jobs, nil, objects, cleanupLock, cfg)
+}
+
+// NewServiceWithTickets 构造包含视频上传票据能力的媒体服务。
+func NewServiceWithTickets(assets repository.MediaAssetRepository, jobs repository.MediaJobRepository, tickets repository.MediaUploadTicketRepository, objects repository.MediaObjectStorage, cleanupLock repository.DistributedLock, cfg Config) *Service {
 	return &Service{
-		assets: assets, jobs: jobs, objects: objects, cleanupLock: cleanupLock,
+		assets: assets, jobs: jobs, tickets: tickets, objects: objects, cleanupLock: cleanupLock,
 		publicBaseURL: strings.TrimRight(strings.TrimSpace(cfg.PublicBaseURL), "/"), maxImageBytes: cfg.MaxImageBytes,
 		maxTotalBytes: cfg.MaxTotalBytes, cleanupAt: cfg.CleanupThresholdPercent, cleanupEvery: cfg.CleanupInterval,
 		cleanupSignal: make(chan struct{}, 1), configChanged: make(chan struct{}, 1),
@@ -182,6 +191,54 @@ func (s *Service) AdminImageStats(ctx context.Context) (ImageStats, error) {
 	return ImageStats{TotalImages: stats.TotalImages, TotalBytes: stats.TotalBytes}, nil
 }
 
+// AdminDeleteImages 删除管理员明确选择的图片对象及其元数据。
+// 不存在或已被并发清理的图片按幂等成功处理；非图片资产不会被删除。
+func (s *Service) AdminDeleteImages(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 || len(ids) > 100 {
+		return 0, ErrInvalidImageSelection
+	}
+	unique := make(map[string]struct{}, len(ids))
+	assets := make([]mediadomain.Asset, 0, len(ids))
+	for _, rawID := range ids {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			return 0, ErrInvalidImageSelection
+		}
+		if _, exists := unique[id]; exists {
+			continue
+		}
+		unique[id] = struct{}{}
+		asset, err := s.assets.GetMediaAsset(ctx, id)
+		if errors.Is(err, repository.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if asset.Kind == "image" {
+			assets = append(assets, asset)
+		}
+	}
+
+	deleted := 0
+	for _, asset := range assets {
+		if err := s.objects.Delete(ctx, asset.StorageKey); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return deleted, err
+		}
+		if err := s.assets.DeleteMediaAsset(ctx, asset.ID); err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				continue
+			}
+			return deleted, err
+		}
+		deleted++
+	}
+	if total, err := s.assets.TotalMediaAssetBytes(ctx); err == nil {
+		s.totalBytes.Store(total)
+	}
+	return deleted, nil
+}
+
 // AdminVideoStats 返回视频任务统计信息。
 func (s *Service) AdminVideoStats(ctx context.Context) (VideoStats, error) {
 	if s.jobs == nil {
@@ -197,16 +254,89 @@ func (s *Service) AdminVideoStats(ctx context.Context) (VideoStats, error) {
 	}, nil
 }
 
+// AdminDeleteVideoJobs 删除管理员明确选择的终态视频任务。
+// 成功任务若已归档本地视频，则同步撤销上传票据并删除对象和媒体元数据；审计记录独立保留。
+func (s *Service) AdminDeleteVideoJobs(ctx context.Context, ids []string) (int, error) {
+	if s.jobs == nil {
+		return 0, ErrMediaJobsUnavailable
+	}
+	if len(ids) == 0 || len(ids) > 100 {
+		return 0, ErrInvalidVideoSelection
+	}
+	unique := make(map[string]struct{}, len(ids))
+	normalized := make([]string, 0, len(ids))
+	for _, rawID := range ids {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			return 0, ErrInvalidVideoSelection
+		}
+		if _, exists := unique[id]; exists {
+			continue
+		}
+		unique[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	jobs, err := s.jobs.GetMediaJobsByIDs(ctx, normalized)
+	if err != nil {
+		return 0, err
+	}
+	for _, job := range jobs {
+		if job.Status != mediadomain.StatusCompleted && job.Status != mediadomain.StatusFailed {
+			return 0, ErrActiveVideoSelection
+		}
+	}
+
+	deleted := 0
+	for _, job := range jobs {
+		if s.tickets != nil {
+			if err := s.tickets.DeleteUploadTicketsByJobID(ctx, job.ID); err != nil {
+				return deleted, err
+			}
+		}
+		if err := s.deleteVideoAsset(ctx, job.ResultAssetID); err != nil {
+			return deleted, err
+		}
+		if err := s.jobs.DeleteMediaJob(ctx, job.ID); err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				continue
+			}
+			return deleted, err
+		}
+		deleted++
+	}
+	if total, err := s.assets.TotalMediaAssetBytes(ctx); err == nil {
+		s.totalBytes.Store(total)
+	}
+	return deleted, nil
+}
+
+// deleteVideoAsset 删除任务绑定的本地视频对象与元数据；缺失对象按幂等成功处理。
+func (s *Service) deleteVideoAsset(ctx context.Context, assetID string) error {
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return nil
+	}
+	asset, err := s.assets.GetMediaAsset(ctx, assetID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if asset.Kind != "video" {
+		return nil
+	}
+	if err := s.objects.Delete(ctx, asset.StorageKey); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := s.assets.DeleteMediaAsset(ctx, asset.ID); err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return err
+	}
+	return nil
+}
+
 func mediaPageQuery(page, pageSize int, search string, sort repository.SortQuery) repository.PageQuery {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 {
-		pageSize = 20
-	}
-	if pageSize > 100 {
-		pageSize = 100
-	}
+	page, pageSize = repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
 	return repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: strings.TrimSpace(search), Sort: sort}
 }
 
@@ -254,7 +384,16 @@ func (s *Service) RunCleanup(ctx context.Context, onError func(error)) {
 	}
 }
 
-// Cleanup 在跨实例锁保护下删除最旧图片，直到回落到自动清理阈值。
+const (
+	cleanupAssetBatchSize  = 200
+	cleanupTicketBatchSize = 200
+	// cleanupTicketMaxBatchesPerRun 限制单次 Cleanup 调用中过期票据的删除批次数。
+	// 超出部分留给后续直接/后台清理继续回收，避免一次调用无界垄断。
+	cleanupTicketMaxBatchesPerRun = 1
+)
+
+// Cleanup 在跨实例锁保护下删除最旧媒体资产，直到回落到自动清理阈值。
+// 同时有界清理过期上传票据。受保护资产被跳过；通过 offset 前进避免整页受保护时死循环。
 func (s *Service) Cleanup(ctx context.Context) (int, error) {
 	cfg := s.runtimeConfig()
 	if s.cleanupLock != nil {
@@ -263,6 +402,18 @@ func (s *Service) Cleanup(ctx context.Context) (int, error) {
 			return 0, err
 		}
 		defer release()
+	}
+	// 过期票据回收：不触碰未过期票据与已登记媒体资产；单次调用有批次数上限。
+	if s.tickets != nil {
+		for batch := 0; batch < cleanupTicketMaxBatchesPerRun; batch++ {
+			n, err := s.tickets.DeleteExpiredUploadTickets(ctx, time.Now().UTC(), cleanupTicketBatchSize)
+			if err != nil {
+				return 0, err
+			}
+			if n < int64(cleanupTicketBatchSize) {
+				break
+			}
+		}
 	}
 	total, err := s.assets.TotalMediaAssetBytes(ctx)
 	if err != nil {
@@ -274,17 +425,26 @@ func (s *Service) Cleanup(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 	deleted := 0
+	offset := 0
 	for total > threshold {
-		values, err := s.assets.ListOldestMediaAssets(ctx, 200)
+		values, err := s.assets.ListOldestMediaAssets(ctx, offset, cleanupAssetBatchSize)
 		if err != nil {
 			return deleted, err
 		}
 		if len(values) == 0 {
 			break
 		}
+		protected, protErr := s.assets.ListProtectedMediaAssetIDs(ctx)
+		if protErr != nil {
+			return deleted, protErr
+		}
+		deletedInBatch := 0
 		for _, asset := range values {
 			if total <= threshold {
 				break
+			}
+			if _, skip := protected[asset.ID]; skip {
+				continue
 			}
 			if err := s.objects.Delete(ctx, asset.StorageKey); err != nil {
 				if errors.Is(err, os.ErrNotExist) {
@@ -297,7 +457,18 @@ func (s *Service) Cleanup(ctx context.Context) (int, error) {
 			}
 			total = max(0, total-asset.SizeBytes)
 			deleted++
+			deletedInBatch++
 		}
+		if deletedInBatch == 0 {
+			// 本页无可删资产：前进 offset 以越过受保护前缀，避免无限循环。
+			if len(values) < cleanupAssetBatchSize {
+				break
+			}
+			offset += len(values)
+			continue
+		}
+		// 删除后最旧顺序变化，从头部重新扫描。
+		offset = 0
 	}
 	s.totalBytes.Store(total)
 	return deleted, nil

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -65,6 +66,42 @@ func TestCatalogContainsAllConsoleModelsAndAliases(t *testing.T) {
 		if !strings.HasPrefix(alias.PublicModel, "Console/") {
 			t.Fatalf("alias %q targets non-canonical model %q", name, alias.PublicModel)
 		}
+	}
+}
+
+func TestSyncAccountIdentityUsesWebSessionWithConsoleCredential(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/auth/session" || request.Method != http.MethodGet {
+			http.NotFound(writer, request)
+			return
+		}
+		if request.Header.Get("User-Agent") != infraegress.DefaultUserAgent {
+			t.Errorf("user agent = %q", request.Header.Get("User-Agent"))
+		}
+		if request.Header.Get("Cookie") != "sso=test-sso; sso-rw=test-sso; cf_clearance=clear" {
+			t.Errorf("cookie = %q", request.Header.Get("Cookie"))
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"user":{"sub":"console-user","email":"console@example.com","teamId":"team-1"}}`))
+	}))
+	t.Cleanup(server.Close)
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _ := cipher.Encrypt("test-sso")
+	cookies, _ := cipher.Encrypt("cf_clearance=clear")
+	adapter := NewAdapter(Config{SessionBaseURL: server.URL}, infraegress.NewManager(consoleEgressRepositoryStub{}, cipher), cipher)
+	identity, err := adapter.SyncAccountIdentity(context.Background(), account.Credential{
+		ID: 1, Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO,
+		EncryptedAccessToken: token, EncryptedCloudflareCookie: cookies,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.UserID != "console-user" || identity.Email != "console@example.com" || identity.TeamID != "team-1" {
+		t.Fatalf("identity = %#v", identity)
 	}
 }
 
@@ -187,6 +224,44 @@ func TestNormalizeReasoningPreservesReferenceEfforts(t *testing.T) {
 	}
 }
 
+func TestNormalizeRequestPreservesGrok420ReasoningEffort(t *testing.T) {
+	spec, ok := Resolve("grok-4.20-0309-reasoning")
+	if !ok {
+		t.Fatal("grok-4.20-0309-reasoning missing")
+	}
+	body, err := normalizeRequest([]byte(`{
+		"model":"grok-4.20-0309-reasoning",
+		"input":"hello",
+		"reasoning":{"effort":"low"}
+	}`), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, _ := payload["reasoning"].(map[string]any)
+	if reasoning["effort"] != "low" {
+		t.Fatalf("reasoning = %#v", reasoning)
+	}
+
+	withoutEffort, err := normalizeRequest([]byte(`{
+		"model":"grok-4.20-0309-reasoning",
+		"input":"hello"
+	}`), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload = nil
+	if err := json.Unmarshal(withoutEffort, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["reasoning"] != nil {
+		t.Fatalf("base model request should retain the upstream default: %#v", payload)
+	}
+}
+
 func TestConsoleImportAcceptsJSONPlainTextAndCookieFormat(t *testing.T) {
 	values, err := parseImportedCredentials([]byte("sso=token-one; sso-rw=token-one\ntoken-two\ntoken-two\n"))
 	if err != nil {
@@ -204,6 +279,18 @@ func TestConsoleImportAcceptsJSONPlainTextAndCookieFormat(t *testing.T) {
 	}
 	if values[0].CloudflareCookies != "cf_clearance=abc" {
 		t.Fatalf("cloudflare cookies = %q", values[0].CloudflareCookies)
+	}
+}
+
+func TestConsoleImportAcceptsJSONLines(t *testing.T) {
+	data := []byte("\xef\xbb\xbf{\"name\":\"first\",\"sso_token\":\"token-one\",\"email\":\"one@example.com\"}\r\n\r\n" +
+		"{\"name\":\"second\",\"token\":\"token-two\",\"user_id\":\"user-two\"}\r\n")
+	values, err := parseImportedCredentials(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 2 || values[0].AccessToken != "token-one" || values[0].Email != "one@example.com" || values[1].AccessToken != "token-two" || values[1].UserID != "user-two" {
+		t.Fatalf("credentials = %#v", values)
 	}
 }
 
@@ -231,12 +318,15 @@ func TestNormalizeRateLimitResponsePrefersRetryAfterHeader(t *testing.T) {
 }
 
 func TestParseConsoleRateLimitMetadataRPS(t *testing.T) {
-	metadata := parseConsoleRateLimitMetadata([]byte(`Too many requests for team 00000000-0000-0000-0000-000000000013 and model grok-4.20-multi-agent-0309. Requests per Second (actual/limit): 2/2`))
+	metadata := parseConsoleRateLimitMetadata([]byte(`{"code":"resource-exhausted","error":"Too many requests for team 00000000-0000-0000-0000-000000000013 and model grok-4.3. Your team's rate limit is — Requests per Second (actual/limit): 2/2."}`))
 	if metadata == nil {
 		t.Fatal("metadata is nil")
 	}
 	if metadata.Scope != provider.RateLimitScopeRPS || metadata.Actual != 2 || metadata.Limit != 2 || metadata.RetryAfter != 2*time.Second {
 		t.Fatalf("metadata = %#v", metadata)
+	}
+	if metadata.TeamID != "00000000-0000-0000-0000-000000000013" || metadata.Model != "grok-4.3" {
+		t.Fatalf("team/model = %q/%q", metadata.TeamID, metadata.Model)
 	}
 }
 
@@ -297,6 +387,59 @@ func TestAdapterAttachesConsoleRateLimitMetadata(t *testing.T) {
 	}
 }
 
+func TestAdapterDoesNotPenalizeEgressForBlockedAccount(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantUpdates int
+	}{
+		{name: "blocked account", body: `{"code":"unauthorized:blocked-user","error":"User is blocked"}`, wantUpdates: 0},
+		{name: "anti-bot rejection", body: `{"error":{"code":7,"message":"Request rejected by anti-bot rules."}}`, wantUpdates: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(writer, test.body)
+			}))
+			defer server.Close()
+
+			cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			encrypted, err := cipher.Encrypt("test-sso")
+			if err != nil {
+				t.Fatal(err)
+			}
+			repository := &recordingConsoleEgressRepository{node: egressdomain.Node{
+				ID: 1, Name: "console", Scope: egressdomain.ScopeConsole, Enabled: true, Health: 1,
+			}}
+			adapter := NewAdapter(Config{BaseURL: server.URL, TimeoutSeconds: 5}, infraegress.NewManager(repository, cipher), cipher)
+			credential := account.Credential{ID: 1, Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, EncryptedAccessToken: encrypted}
+			response, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+				Credential: credential, Method: http.MethodPost, Path: "/responses", Model: "grok-4.3",
+				Operation: conversation.OperationResponses, NormalizeBody: true, Body: []byte(`{"model":"grok-4.3","input":"hello"}`),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusForbidden || string(body) != test.body {
+				t.Fatalf("status=%d body=%s", response.StatusCode, body)
+			}
+			if updates := repository.UpdateCount(); updates != test.wantUpdates {
+				t.Fatalf("egress updates = %d, want %d", updates, test.wantUpdates)
+			}
+		})
+	}
+}
+
 func TestAdapterForwardsConsoleHeadersAndNormalizedBody(t *testing.T) {
 	var received map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -305,6 +448,14 @@ func TestAdapterForwardsConsoleHeadersAndNormalizedBody(t *testing.T) {
 		}
 		if request.Header.Get("Authorization") != "Bearer anonymous" || request.Header.Get("x-cluster") != "https://us-east-1.api.x.ai" || request.Header.Get("Accept") != "*/*" || request.Header.Get("Priority") != "u=1, i" {
 			t.Errorf("headers = %#v", request.Header)
+		}
+		if request.Header.Get("User-Agent") != infraegress.DefaultUserAgent {
+			t.Errorf("user-agent = %q", request.Header.Get("User-Agent"))
+		}
+		if request.Header.Get("Sec-Ch-Ua") != `"Google Chrome";v="146", "Chromium";v="146", "Not(A:Brand";v="24"` ||
+			request.Header.Get("Sec-Ch-Ua-Mobile") != "?0" || request.Header.Get("Sec-Ch-Ua-Platform") != `"macOS"` ||
+			request.Header.Get("Sec-Ch-Ua-Arch") != "x86" || request.Header.Get("Sec-Ch-Ua-Bitness") != "64" {
+			t.Errorf("client hints = %#v", request.Header)
 		}
 		cookie := request.Header.Get("Cookie")
 		if !strings.Contains(cookie, "sso=test-sso") || !strings.Contains(cookie, "sso-rw=test-sso") {
@@ -339,6 +490,16 @@ func TestAdapterForwardsConsoleHeadersAndNormalizedBody(t *testing.T) {
 	}
 	if received["model"] != "grok-4.3" || received["store"] != false || received["metadata"] != nil {
 		t.Fatalf("received = %#v", received)
+	}
+}
+
+func TestApplyChromiumClientHintsSkipsNonChromiumUserAgent(t *testing.T) {
+	header := make(http.Header)
+	applyChromiumClientHints(header, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/18.0 Safari/605.1.15")
+	for name := range header {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), "Sec-Ch-Ua") {
+			t.Fatalf("unexpected client hint %q", name)
+		}
 	}
 }
 
@@ -399,7 +560,7 @@ func newConsoleTestAdapter(t *testing.T, baseURL string) (*Adapter, account.Cred
 	if err != nil {
 		t.Fatal(err)
 	}
-	adapter := NewAdapter(Config{BaseURL: baseURL, UserAgent: "console-test", TimeoutSeconds: 5}, infraegress.NewManager(consoleEgressRepositoryStub{}, cipher), cipher)
+	adapter := NewAdapter(Config{BaseURL: baseURL, TimeoutSeconds: 5}, infraegress.NewManager(consoleEgressRepositoryStub{}, cipher), cipher)
 	credential := account.Credential{ID: 1, Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, EncryptedAccessToken: encrypted}
 	return adapter, credential
 }
@@ -424,4 +585,47 @@ func (consoleEgressRepositoryStub) UpdateEgressNode(context.Context, egressdomai
 
 func (consoleEgressRepositoryStub) DeleteEgressNode(context.Context, uint64) error {
 	return errors.New("unsupported")
+}
+
+type recordingConsoleEgressRepository struct {
+	mu      sync.Mutex
+	node    egressdomain.Node
+	updates int
+}
+
+func (r *recordingConsoleEgressRepository) ListEgressNodes(_ context.Context, scope egressdomain.Scope, _ repository.SortQuery) ([]egressdomain.Node, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.node.Scope != scope {
+		return nil, nil
+	}
+	return []egressdomain.Node{r.node}, nil
+}
+
+func (r *recordingConsoleEgressRepository) GetEgressNode(context.Context, uint64) (egressdomain.Node, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.node, nil
+}
+
+func (r *recordingConsoleEgressRepository) CreateEgressNode(context.Context, egressdomain.Node) (egressdomain.Node, error) {
+	return egressdomain.Node{}, errors.New("unsupported")
+}
+
+func (r *recordingConsoleEgressRepository) UpdateEgressNode(_ context.Context, value egressdomain.Node) (egressdomain.Node, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.node = value
+	r.updates++
+	return value, nil
+}
+
+func (r *recordingConsoleEgressRepository) DeleteEgressNode(context.Context, uint64) error {
+	return errors.New("unsupported")
+}
+
+func (r *recordingConsoleEgressRepository) UpdateCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.updates
 }

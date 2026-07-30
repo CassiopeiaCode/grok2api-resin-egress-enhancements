@@ -3,8 +3,8 @@ package gateway
 import (
 	"container/heap"
 	"context"
+	"crypto/sha256"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -12,12 +12,13 @@ import (
 )
 
 type candidateScore struct {
-	index        int
-	tier         int
-	billingFresh bool
-	inFlight     int
-	remaining    float64
-	lastSelected time.Time
+	index           int
+	tier            int
+	preferFreeBuild bool
+	billingFresh    bool
+	inFlight        int
+	remaining       float64
+	lastSelected    time.Time
 }
 
 // candidatePlan 使用线性建堆保留完整路由优先级，并允许 claim 失败后按顺序取下一账号。
@@ -64,6 +65,9 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	if leftCandidate.ModelCapabilityKnown != rightCandidate.ModelCapabilityKnown {
 		return leftCandidate.ModelCapabilityKnown
 	}
+	if leftScore.preferFreeBuild != rightScore.preferFreeBuild {
+		return leftScore.preferFreeBuild
+	}
 	if leftScore.tier != rightScore.tier {
 		return leftScore.tier < rightScore.tier
 	}
@@ -87,49 +91,81 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 
 // planCandidates 批量读取动态并发状态，并以 O(n) 建堆生成保持原比较规则的候选计划。
 func (s *Selector) planCandidates(ctx context.Context, values []account.RoutingCandidate, now time.Time, tierOrder []account.WebTier) (*candidatePlan, error) {
-	indexes := make([]int, len(values))
-	for index := range values {
-		indexes[index] = index
-	}
-	return s.planCandidateIndexes(ctx, values, indexes, now, tierOrder)
+	return s.planCandidateIndexes(ctx, values, nil, now, tierOrder)
 }
 
-// planCandidateIndexes 让热路径只携带轻量下标，避免每次请求复制数万份
-// RoutingCandidate（其中包含多个字符串、时间和指针字段）。
+// planCandidateIndexes 在不可变候选快照上按下标规划，避免过滤阶段复制完整账号结构。
+// indexes 为 nil 时表示使用 values 的全部元素。
 func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier) (*candidatePlan, error) {
-	keys := make([]string, len(indexes))
-	for position, index := range indexes {
-		keys[position] = accountConcurrencyKey(values[index].Credential.ID)
+	return s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierOrder, nil, s.preferFreeBuildEnabled())
+}
+
+func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, concurrencyHints []int, preferFreeBuild bool) (*candidatePlan, error) {
+	length := len(indexes)
+	if indexes == nil {
+		length = len(values)
 	}
-	var concurrencySnapshot map[string]int
-	batchReader, batched := s.concurrency.(repository.ConcurrencySnapshotReader)
-	if batched {
-		var err error
-		concurrencySnapshot, err = batchReader.CurrentMany(ctx, keys)
+	inFlight := make([]int, length)
+	if concurrencyHints == nil {
+		keys := make([]string, length)
+		for position := range length {
+			index := position
+			if indexes != nil {
+				index = indexes[position]
+			}
+			keys[position] = accountConcurrencyKey(values[index].Credential.ID)
+		}
+		concurrencySnapshot, err := s.loadConcurrencySnapshot(ctx, keys)
 		if err != nil {
-			return nil, fmt.Errorf("批量读取账号并发租约: %w", err)
+			return nil, err
 		}
-	}
-	inFlight := make([]int, len(indexes))
-	for index := range indexes {
-		if batched {
-			inFlight[index] = concurrencySnapshot[keys[index]]
-			continue
+		for position := range length {
+			inFlight[position] = concurrencySnapshot[keys[position]]
 		}
-		current, err := s.concurrency.Current(ctx, keys[index])
-		if err != nil {
-			return nil, fmt.Errorf("读取账号并发租约: %w", err)
+	} else {
+		missingIndexes := make([]int, 0, length)
+		keys := make([]string, 0, length)
+		for position := range length {
+			index := position
+			if indexes != nil {
+				index = indexes[position]
+			}
+			if concurrencyHints[index] != 0 {
+				continue
+			}
+			missingIndexes = append(missingIndexes, index)
+			keys = append(keys, accountConcurrencyKey(values[index].Credential.ID))
 		}
-		inFlight[index] = current
+		if len(keys) > 0 {
+			concurrencySnapshot, err := s.loadConcurrencySnapshot(ctx, keys)
+			if err != nil {
+				return nil, err
+			}
+			for position, index := range missingIndexes {
+				concurrencyHints[index] = concurrencySnapshot[keys[position]] + 1
+			}
+		}
+		for position := range length {
+			index := position
+			if indexes != nil {
+				index = indexes[position]
+			}
+			inFlight[position] = concurrencyHints[index] - 1
+		}
 	}
 
-	s.mu.Lock()
-	scores := make([]candidateScore, len(indexes))
-	for position, index := range indexes {
+	s.selectionMu.RLock()
+	scores := make([]candidateScore, length)
+	for position := range length {
+		index := position
+		if indexes != nil {
+			index = indexes[position]
+		}
 		candidate := values[index]
 		score := candidateScore{
 			index: index, tier: tierOrderRank(tierOrder, candidate.Credential.WebTier),
-			inFlight: inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
+			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
+			inFlight:        inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
 		}
 		if candidate.Billing != nil {
 			score.remaining = candidate.Billing.Remaining()
@@ -137,13 +173,54 @@ func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.Ro
 		}
 		scores[position] = score
 	}
-	s.mu.Unlock()
-
+	s.selectionMu.RUnlock()
 	plan := &candidatePlan{values: values, scores: scores}
 	heap.Init(plan)
 	return plan, nil
 }
 
+// loadConcurrencySnapshot 在极短窗口内合并相同候选池的并发快照读取。
+// 快照只参与排序，最终容量仍由原子 Acquire 校验，因此陈旧快照不会突破账号并发上限。
+func (s *Selector) loadConcurrencySnapshot(ctx context.Context, keys []string) (map[string]int, error) {
+	cacheKey := concurrencySnapshotKey(keys)
+	load := func() (map[string]int, error) {
+		values := make(map[string]int, len(keys))
+		if batchReader, ok := s.concurrency.(repository.ConcurrencySnapshotReader); ok {
+			var err error
+			values, err = batchReader.CurrentMany(ctx, keys)
+			if err != nil {
+				return nil, fmt.Errorf("批量读取账号并发租约: %w", err)
+			}
+		} else {
+			for _, key := range keys {
+				current, err := s.concurrency.Current(ctx, key)
+				if err != nil {
+					return nil, fmt.Errorf("读取账号并发租约: %w", err)
+				}
+				values[key] = current
+			}
+		}
+		return values, nil
+	}
+	// 仅测试中的手工 Selector 可能没有初始化缓存，保持最小兼容回退。
+	if s.concurrencySnapshots == nil {
+		return load()
+	}
+	return s.concurrencySnapshots.Load(ctx, cacheKey, time.Now(), load)
+}
+
+func concurrencySnapshotKey(keys []string) [32]byte {
+	hash := sha256.New()
+	separator := []byte{0}
+	for _, key := range keys {
+		_, _ = hash.Write([]byte(key))
+		_, _ = hash.Write(separator)
+	}
+	var result [32]byte
+	copy(result[:], hash.Sum(nil))
+	return result
+}
+
 func accountConcurrencyKey(accountID uint64) string {
-	return "account:" + strconv.FormatUint(accountID, 10)
+	return repository.AccountConcurrencyKey(accountID)
 }

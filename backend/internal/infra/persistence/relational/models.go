@@ -25,16 +25,18 @@ type adminSessionModel struct {
 func (adminSessionModel) TableName() string { return "admin_sessions" }
 
 type accountModel struct {
-	ID               uint64  `gorm:"primaryKey;autoIncrement"`
-	IdentityKey      string  `gorm:"size:64;uniqueIndex;not null;check:chk_accounts_identity_key,length(identity_key) = 64"`
-	Provider         string  `gorm:"size:32;not null;check:chk_accounts_provider,provider IN ('grok_build','grok_web','grok_console');index:idx_accounts_provider_source,priority:1"`
-	Name             string  `gorm:"size:160;not null;check:chk_accounts_name,length(trim(name)) BETWEEN 1 AND 160"`
-	Email            string  `gorm:"size:255;check:chk_accounts_email,length(email) <= 255"`
-	UserID           string  `gorm:"size:255;check:chk_accounts_user_id,length(user_id) <= 255"`
-	TeamID           string  `gorm:"size:255;check:chk_accounts_team_id,length(team_id) <= 255"`
-	SourceKey        string  `gorm:"size:512;not null;check:chk_accounts_source_key,length(trim(source_key)) BETWEEN 1 AND 512;index:idx_accounts_provider_source,priority:2"`
-	Enabled          bool    `gorm:"not null"`
-	AuthStatus       string  `gorm:"size:32;not null;check:chk_accounts_auth_status,auth_status IN ('active','reauthRequired')"`
+	ID          uint64 `gorm:"primaryKey;autoIncrement"`
+	IdentityKey string `gorm:"size:64;uniqueIndex;not null;check:chk_accounts_identity_key,length(identity_key) = 64"`
+	Provider    string `gorm:"size:32;not null;check:chk_accounts_provider,provider IN ('grok_build','grok_web','grok_console');index:idx_accounts_provider_source,priority:1"`
+	Name        string `gorm:"size:160;not null;check:chk_accounts_name,length(trim(name)) BETWEEN 1 AND 160"`
+	Email       string `gorm:"size:255;check:chk_accounts_email,length(email) <= 255"`
+	UserID      string `gorm:"size:255;check:chk_accounts_user_id,length(user_id) <= 255"`
+	TeamID      string `gorm:"size:255;check:chk_accounts_team_id,length(team_id) <= 255"`
+	SourceKey   string `gorm:"size:512;not null;check:chk_accounts_source_key,length(trim(source_key)) BETWEEN 1 AND 512;index:idx_accounts_provider_source,priority:2"`
+	Enabled     bool   `gorm:"not null"`
+	AuthStatus  string `gorm:"size:32;not null;check:chk_accounts_auth_status,auth_status IN ('active','reauthRequired')"`
+	// ReauthMarkedAt 进入 reauthRequired 的时刻；active 时为 NULL。
+	ReauthMarkedAt   *time.Time
 	Priority         int     `gorm:"not null;default:1"`
 	MaxConcurrent    int     `gorm:"not null;default:8;check:chk_accounts_max_concurrent,max_concurrent BETWEEN 1 AND 256"`
 	MinimumRemaining float64 `gorm:"not null;check:chk_accounts_minimum_remaining,minimum_remaining >= 0"`
@@ -44,10 +46,22 @@ type accountModel struct {
 	LastUsedAt       *time.Time
 	ObservedModel    string `gorm:"size:255;check:chk_accounts_observed_model,length(observed_model) <= 255"`
 	ObservedModelAt  *time.Time
-	CreatedAt        time.Time               `gorm:"not null"`
-	UpdatedAt        time.Time               `gorm:"not null"`
-	Credential       *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
-	WebProfile       *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	// BuildAPIFallback 仅对 grok_build 有意义：XAI 推理回退标记；其他 Provider 保持 false。
+	BuildAPIFallback bool `gorm:"not null;default:false"`
+	// BuildRouteMode 仅控制 grok_build 推理地址；其它 Provider 固定 auto。
+	BuildRouteMode string `gorm:"size:16;not null;default:auto;check:chk_accounts_build_route_mode,build_route_mode IN ('auto','build','xai')"`
+	// BuildSuperEntitled 仅对 grok_build 有意义：管理员确认的 Super/1.5 entitlement；其他 Provider 保持 false。
+	BuildSuperEntitled bool `gorm:"not null;default:false"`
+	// EgressNodeID is nullable so existing accounts retain the legacy pool
+	// routing behavior until an administrator explicitly assigns a node.
+	EgressNodeID         *uint64 `gorm:"index:idx_accounts_egress_node"`
+	EgressAssignmentMode string  `gorm:"size:16;not null;default:'';check:chk_accounts_egress_assignment_mode,egress_assignment_mode IN ('','manual','auto')"`
+	EgressAssignedAt     *time.Time
+	CreatedAt            time.Time               `gorm:"not null"`
+	UpdatedAt            time.Time               `gorm:"not null"`
+	Credential           *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	WebProfile           *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	EgressNode           *egressNodeModel        `gorm:"foreignKey:EgressNodeID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
 }
 
 func (accountModel) TableName() string { return "provider_accounts" }
@@ -63,7 +77,10 @@ type accountCredentialModel struct {
 	RefreshDueAt              *time.Time
 	LastRefreshAt             *time.Time
 	RefreshFailures           int           `gorm:"not null;default:0;check:chk_account_credentials_refresh_failures,refresh_failures >= 0"`
+	LastRefreshErrorStatus    int           `gorm:"not null;default:0;check:chk_account_credentials_refresh_error_status,last_refresh_error_status >= 0"`
 	LastRefreshError          string        `gorm:"size:100;not null;default:'';check:chk_account_credentials_refresh_error,length(last_refresh_error) <= 100"`
+	LastRefreshErrorMessage   string        `gorm:"size:512;not null;default:'';check:chk_account_credentials_refresh_error_message,length(last_refresh_error_message) <= 512"`
+	LastRefreshErrorResponse  string        `gorm:"size:4096;not null;default:'';check:chk_account_credentials_refresh_error_response,length(last_refresh_error_response) <= 4096"`
 	RefreshPermanent          bool          `gorm:"not null;default:false"`
 	UpdatedAt                 time.Time     `gorm:"not null"`
 	Account                   *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
@@ -81,11 +98,26 @@ type accountProviderLinkModel struct {
 
 func (accountProviderLinkModel) TableName() string { return "account_provider_links" }
 
+type webConsoleAccountLinkModel struct {
+	WebAccountID     uint64        `gorm:"primaryKey"`
+	ConsoleAccountID uint64        `gorm:"uniqueIndex;not null;check:chk_web_console_account_links_distinct,web_account_id <> console_account_id"`
+	CreatedAt        time.Time     `gorm:"not null"`
+	WebAccount       *accountModel `gorm:"foreignKey:WebAccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	ConsoleAccount   *accountModel `gorm:"foreignKey:ConsoleAccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+}
+
+func (webConsoleAccountLinkModel) TableName() string { return "web_console_account_links" }
+
 type webAccountProfileModel struct {
-	AccountID uint64 `gorm:"primaryKey"`
-	Tier      string `gorm:"size:16;not null;check:chk_web_account_profiles_tier,tier IN ('auto','basic','super','heavy')"`
-	SyncedAt  *time.Time
-	Account   *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	AccountID            uint64 `gorm:"primaryKey"`
+	Tier                 string `gorm:"size:16;not null;check:chk_web_account_profiles_tier,tier IN ('auto','basic','super','heavy')"`
+	SyncedAt             *time.Time
+	NSFWEnabledAt        *time.Time
+	TermsAcceptedAt      *time.Time
+	TermsAcceptedVersion int `gorm:"not null;default:0"`
+	BirthDateSetAt       *time.Time
+	EgressIdentity       string        `gorm:"size:128;not null;default:'';check:chk_web_account_profiles_egress_identity,length(egress_identity) <= 128"`
+	Account              *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
 
 func (webAccountProfileModel) TableName() string { return "web_account_profiles" }
@@ -150,8 +182,8 @@ func (quotaRecoveryModel) TableName() string { return "account_quota_recovery" }
 type modelRouteModel struct {
 	ID            uint64    `gorm:"primaryKey;autoIncrement"`
 	PublicID      string    `gorm:"size:255;uniqueIndex;not null;check:chk_model_routes_public_id,length(trim(public_id)) BETWEEN 1 AND 255"`
-	Provider      string    `gorm:"size:32;uniqueIndex:uidx_provider_upstream;not null;check:chk_model_routes_provider,provider IN ('grok_build','grok_web','grok_console')"`
-	UpstreamModel string    `gorm:"size:255;uniqueIndex:uidx_provider_upstream;not null;check:chk_model_routes_upstream_model,length(trim(upstream_model)) BETWEEN 1 AND 255"`
+	Provider      string    `gorm:"size:32;index:idx_model_routes_provider_upstream;not null;check:chk_model_routes_provider,provider IN ('grok_build','grok_web','grok_console')"`
+	UpstreamModel string    `gorm:"size:255;index:idx_model_routes_provider_upstream;not null;check:chk_model_routes_upstream_model,length(trim(upstream_model)) BETWEEN 1 AND 255"`
 	Capability    string    `gorm:"size:32;not null;check:chk_model_routes_capability,capability IN ('responses','chat','image','image_edit','video')"`
 	Origin        string    `gorm:"size:32;not null;default:discovered;check:chk_model_routes_origin,origin IN ('catalog','discovered','manual')"`
 	Enabled       bool      `gorm:"not null"`
@@ -217,14 +249,18 @@ type clientKeyModel struct {
 	EncryptedSecret       string `gorm:"type:text;not null;check:chk_client_keys_encrypted_secret,length(trim(encrypted_secret)) BETWEEN 1 AND 4096"`
 	Enabled               bool   `gorm:"not null"`
 	ExpiresAt             *time.Time
-	RPMLimit              int   `gorm:"not null;default:120;check:chk_client_keys_rpm,rpm_limit BETWEEN 1 AND 100000"`
-	MaxConcurrent         int   `gorm:"not null;default:8;check:chk_client_keys_max_concurrent,max_concurrent BETWEEN 1 AND 1024"`
+	RPMLimit              int   `gorm:"not null;default:120;check:chk_client_keys_rpm,rpm_limit BETWEEN 0 AND 100000"`
+	MaxConcurrent         int   `gorm:"not null;default:8;check:chk_client_keys_max_concurrent,max_concurrent BETWEEN 0 AND 1024"`
 	BillingLimitUSDTicks  int64 `gorm:"not null;default:0;check:chk_client_keys_billing_limit,billing_limit_usd_ticks BETWEEN 0 AND 9000000000000000"`
 	BilledUsageUSDTicks   int64 `gorm:"not null;default:0;check:chk_client_keys_billed_usage,billed_usage_usd_ticks >= 0"`
 	ReservedUsageUSDTicks int64 `gorm:"not null;default:0;check:chk_client_keys_reserved_usage,reserved_usage_usd_ticks >= 0"`
-	LastUsedAt            *time.Time
-	CreatedAt             time.Time `gorm:"not null"`
-	UpdatedAt             time.Time `gorm:"not null"`
+	// AllowModelAliases defaults false so existing keys keep a clean base-model list.
+	AllowModelAliases bool  `gorm:"not null;default:false"`
+	ProviderScopeMask uint8 `gorm:"not null;default:7;check:chk_client_keys_provider_scope,provider_scope_mask BETWEEN 1 AND 7"`
+	TierScopeMask     uint8 `gorm:"not null;default:7;check:chk_client_keys_tier_scope,tier_scope_mask IN (1,2,3,7)"`
+	LastUsedAt        *time.Time
+	CreatedAt         time.Time `gorm:"not null"`
+	UpdatedAt         time.Time `gorm:"not null"`
 }
 
 func (clientKeyModel) TableName() string { return "client_keys" }
@@ -259,7 +295,7 @@ type requestAuditModel struct {
 	ModelPublicID           string    `gorm:"size:255;check:chk_request_audits_model_public_id,length(model_public_id) <= 255"`
 	ModelUpstreamModel      string    `gorm:"size:255;check:chk_request_audits_model_upstream_model,length(model_upstream_model) <= 255"`
 	Provider                string    `gorm:"size:32;not null;check:chk_request_audits_provider,provider IN ('grok_build','grok_web','grok_console')"`
-	Operation               string    `gorm:"size:32;not null;check:chk_request_audits_operation,operation IN ('responses','chat','messages','image','image_edit','video')"`
+	Operation               string    `gorm:"size:32;not null;check:chk_request_audits_operation,operation IN ('responses','compaction','chat','messages','image','image_edit','video')"`
 	UsageSource             string    `gorm:"size:16;not null;check:chk_request_audits_usage_source,usage_source IN ('upstream','estimated','none')"`
 	AccountID               *uint64   `gorm:"check:chk_request_audits_account_id,account_id IS NULL OR account_id > 0"`
 	AccountName             string    `gorm:"size:160;check:chk_request_audits_account_name,length(account_name) <= 160"`
@@ -285,6 +321,7 @@ type requestAuditModel struct {
 	NumServerSideToolsUsed  int64     `gorm:"not null;default:0"`
 	ContextInputTokens      int64     `gorm:"not null;default:0"`
 	ContextOutputTokens     int64     `gorm:"not null;default:0"`
+	FirstTokenMS            *int64    `gorm:"column:first_token_ms"`
 	DurationMS              int64     `gorm:"not null;default:0"`
 	ErrorCode               string    `gorm:"size:100;check:chk_request_audits_error_code,length(error_code) <= 100"`
 	AttemptCount            int       `gorm:"not null;default:0;check:chk_request_audits_attempt_count,attempt_count >= 0"`
@@ -319,15 +356,17 @@ type requestAuditAttemptModel struct {
 func (requestAuditAttemptModel) TableName() string { return "request_audit_attempts" }
 
 type responseOwnershipModel struct {
-	ResponseID  string          `gorm:"size:255;primaryKey;check:chk_response_ownership_id,length(response_id) BETWEEN 1 AND 255"`
-	AccountID   uint64          `gorm:"not null"`
-	ClientKeyID uint64          `gorm:"not null"`
-	Provider    string          `gorm:"size:32;not null;check:chk_response_ownership_provider,provider IN ('grok_build','grok_web','grok_console')"`
-	ExpiresAt   time.Time       `gorm:"not null;check:chk_response_ownership_expiry,expires_at > created_at"`
-	CreatedAt   time.Time       `gorm:"not null"`
-	UpdatedAt   time.Time       `gorm:"not null"`
-	Account     *accountModel   `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
-	ClientKey   *clientKeyModel `gorm:"foreignKey:ClientKeyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	ResponseID         string          `gorm:"size:255;primaryKey;check:chk_response_ownership_id,length(response_id) BETWEEN 1 AND 255"`
+	AccountID          uint64          `gorm:"not null"`
+	ClientKeyID        uint64          `gorm:"not null"`
+	Provider           string          `gorm:"size:32;not null;check:chk_response_ownership_provider,provider IN ('grok_build','grok_web','grok_console')"`
+	PromptCacheKey     string          `gorm:"size:64;not null;default:'';check:chk_response_ownership_cache_key,length(prompt_cache_key) <= 64"`
+	ReasoningReplayKey string          `gorm:"size:64;not null;default:'';check:chk_response_ownership_replay_key,length(reasoning_replay_key) <= 64"`
+	ExpiresAt          time.Time       `gorm:"not null;check:chk_response_ownership_expiry,expires_at > created_at"`
+	CreatedAt          time.Time       `gorm:"not null"`
+	UpdatedAt          time.Time       `gorm:"not null"`
+	Account            *accountModel   `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	ClientKey          *clientKeyModel `gorm:"foreignKey:ClientKeyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
 
 func (responseOwnershipModel) TableName() string { return "response_ownership" }
@@ -348,54 +387,76 @@ type webResponseStateModel struct {
 func (webResponseStateModel) TableName() string { return "web_response_states" }
 
 type mediaJobModel struct {
-	ID              string  `gorm:"size:64;primaryKey;check:chk_media_jobs_id,length(id) BETWEEN 1 AND 64"`
-	RequestID       string  `gorm:"size:64;not null;check:chk_media_jobs_request_id,length(request_id) BETWEEN 1 AND 64"`
-	ClientKeyID     uint64  `gorm:"not null;check:chk_media_jobs_client_key_id,client_key_id > 0"`
-	ClientKeyName   string  `gorm:"size:160;not null;default:'';check:chk_media_jobs_client_key_name,length(client_key_name) <= 160"`
-	AccountID       uint64  `gorm:"not null;check:chk_media_jobs_account_id,account_id > 0"`
-	AccountName     string  `gorm:"size:160;not null;default:'';check:chk_media_jobs_account_name,length(account_name) <= 160"`
-	EgressNodeID    *uint64 `gorm:"check:chk_media_jobs_egress_node_id,egress_node_id IS NULL OR egress_node_id > 0"`
-	EgressNodeName  string  `gorm:"size:160;not null;default:'';check:chk_media_jobs_egress_node_name,length(egress_node_name) <= 160"`
-	EgressScope     string  `gorm:"size:32;not null;default:'';check:chk_media_jobs_egress_scope,egress_scope IN ('','grok_web')"`
-	EgressMode      string  `gorm:"size:16;not null;default:'';check:chk_media_jobs_egress_mode,egress_mode IN ('','direct','proxy')"`
-	Provider        string  `gorm:"size:32;not null;check:chk_media_jobs_provider,provider IN ('grok_web')"`
-	Model           string  `gorm:"size:255;not null;check:chk_media_jobs_model,length(trim(model)) BETWEEN 1 AND 255"`
-	ModelRouteID    uint64  `gorm:"not null;check:chk_media_jobs_model_route_id,model_route_id > 0"`
-	UpstreamModel   string  `gorm:"size:255;not null;check:chk_media_jobs_upstream_model,length(trim(upstream_model)) BETWEEN 1 AND 255"`
-	Prompt          string  `gorm:"type:text;not null;check:chk_media_jobs_prompt,length(prompt) BETWEEN 0 AND 100000"`
-	Seconds         int     `gorm:"not null;check:chk_media_jobs_seconds,seconds BETWEEN 1 AND 15"`
-	Size            string  `gorm:"size:32;not null;check:chk_media_jobs_size,length(trim(size)) BETWEEN 1 AND 32"`
-	Quality         string  `gorm:"size:32;not null;check:chk_media_jobs_quality,length(trim(quality)) BETWEEN 1 AND 32"`
-	Status          string  `gorm:"size:32;not null;check:chk_media_jobs_status,status IN ('queued','in_progress','completed','failed')"`
-	Progress        int     `gorm:"not null;check:chk_media_jobs_progress,progress BETWEEN 0 AND 100"`
-	InputJSON       string  `gorm:"type:text;not null;default:'{}';check:chk_media_jobs_input_json,length(input_json) <= 1048576"`
-	UpstreamURL     string  `gorm:"type:text;not null;default:'';check:chk_media_jobs_upstream_url,length(upstream_url) <= 8192"`
-	ContentType     string  `gorm:"size:128;not null;default:'';check:chk_media_jobs_content_type,length(content_type) <= 128"`
-	ErrorCode       string  `gorm:"size:100;not null;default:'';check:chk_media_jobs_error_code,length(error_code) <= 100"`
-	ErrorMessage    string  `gorm:"size:512;not null;default:'';check:chk_media_jobs_error_message,length(error_message) <= 512"`
+	ID             string  `gorm:"size:64;primaryKey;check:chk_media_jobs_id,length(id) BETWEEN 1 AND 64"`
+	RequestID      string  `gorm:"size:64;not null;check:chk_media_jobs_request_id,length(request_id) BETWEEN 1 AND 64"`
+	ClientKeyID    uint64  `gorm:"not null;check:chk_media_jobs_client_key_id,client_key_id > 0"`
+	ClientKeyName  string  `gorm:"size:160;not null;default:'';check:chk_media_jobs_client_key_name,length(client_key_name) <= 160"`
+	AccountID      *uint64 `gorm:"check:chk_media_jobs_account_id,account_id IS NULL OR account_id > 0"`
+	AccountName    string  `gorm:"size:160;not null;default:'';check:chk_media_jobs_account_name,length(account_name) <= 160"`
+	EgressNodeID   *uint64 `gorm:"check:chk_media_jobs_egress_node_id,egress_node_id IS NULL OR egress_node_id > 0"`
+	EgressNodeName string  `gorm:"size:160;not null;default:'';check:chk_media_jobs_egress_node_name,length(egress_node_name) <= 160"`
+	EgressScope    string  `gorm:"size:32;not null;default:'';check:chk_media_jobs_egress_scope,egress_scope IN ('','grok_web','grok_build')"`
+	EgressMode     string  `gorm:"size:16;not null;default:'';check:chk_media_jobs_egress_mode,egress_mode IN ('','direct','proxy')"`
+	Provider       string  `gorm:"size:32;not null;check:chk_media_jobs_provider,provider IN ('grok_web','grok_build')"`
+	Model          string  `gorm:"size:255;not null;check:chk_media_jobs_model,length(trim(model)) BETWEEN 1 AND 255"`
+	ModelRouteID   uint64  `gorm:"not null;check:chk_media_jobs_model_route_id,model_route_id > 0"`
+	UpstreamModel  string  `gorm:"size:255;not null;check:chk_media_jobs_upstream_model,length(trim(upstream_model)) BETWEEN 1 AND 255"`
+	Prompt         string  `gorm:"type:text;not null;check:chk_media_jobs_prompt,length(prompt) BETWEEN 0 AND 100000"`
+	Seconds        int     `gorm:"not null;check:chk_media_jobs_seconds,seconds BETWEEN 1 AND 15"`
+	Size           string  `gorm:"size:32;not null;check:chk_media_jobs_size,length(trim(size)) BETWEEN 1 AND 32"`
+	Quality        string  `gorm:"size:32;not null;check:chk_media_jobs_quality,length(trim(quality)) BETWEEN 1 AND 32"`
+	Status         string  `gorm:"size:32;not null;check:chk_media_jobs_status,status IN ('queued','in_progress','completed','failed')"`
+	Progress       int     `gorm:"not null;check:chk_media_jobs_progress,progress BETWEEN 0 AND 100"`
+	// InputJSON limit 33554432 must stay equal to media.MaxInputJSONBytes (GORM tags require literals).
+	InputJSON string `gorm:"type:text;not null;default:'{}';check:chk_media_jobs_input_json,length(input_json) <= 33554432"`
+	// InputImageCount upper bound 8 must stay equal to media.MaxInputImages.
+	InputImageCount *int   `gorm:"check:chk_media_jobs_input_image_count,input_image_count IS NULL OR input_image_count BETWEEN 0 AND 8"`
+	UpstreamURL     string `gorm:"type:text;not null;default:'';check:chk_media_jobs_upstream_url,length(upstream_url) <= 8192"`
+	ResultAssetID   string `gorm:"size:64;not null;default:'';check:chk_media_jobs_result_asset_id,result_asset_id = '' OR length(trim(result_asset_id)) BETWEEN 16 AND 64"`
+	ContentType     string `gorm:"size:128;not null;default:'';check:chk_media_jobs_content_type,length(content_type) <= 128"`
+	ErrorCode       string `gorm:"size:100;not null;default:'';check:chk_media_jobs_error_code,length(error_code) <= 100"`
+	ErrorMessage    string `gorm:"size:512;not null;default:'';check:chk_media_jobs_error_message,length(error_message) <= 512"`
 	LeaseUntil      *time.Time
 	ClaimToken      string    `gorm:"size:64;not null;default:'';check:chk_media_jobs_claim_token,claim_token = '' OR length(claim_token) BETWEEN 16 AND 64"`
 	CreatedAt       time.Time `gorm:"not null"`
 	UpdatedAt       time.Time `gorm:"not null"`
 	CompletedAt     *time.Time
 	UsageRecordedAt *time.Time
-	Account         *accountModel   `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
+	Account         *accountModel   `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
 	ClientKey       *clientKeyModel `gorm:"foreignKey:ClientKeyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
 }
 
 func (mediaJobModel) TableName() string { return "media_jobs" }
 
+// MaxVideoAssetBytes 是本地视频对象与上传接收的安全体积上限（256 MiB）。
+const MaxVideoAssetBytes = 256 << 20
+
 type mediaAssetModel struct {
 	ID         string    `gorm:"size:64;primaryKey;check:chk_media_assets_id,length(trim(id)) BETWEEN 16 AND 64"`
-	Kind       string    `gorm:"size:16;not null;check:chk_media_assets_kind,kind IN ('image')"`
+	Kind       string    `gorm:"size:16;not null;check:chk_media_assets_kind,kind IN ('image','video')"`
 	StorageKey string    `gorm:"size:512;not null;uniqueIndex;check:chk_media_assets_storage_key,length(trim(storage_key)) BETWEEN 1 AND 512"`
-	MIMEType   string    `gorm:"size:64;not null;check:chk_media_assets_mime,mime_type IN ('image/jpeg','image/png','image/webp','image/gif')"`
-	SizeBytes  int64     `gorm:"not null;check:chk_media_assets_size,size_bytes > 0 AND size_bytes <= 33554432"`
+	MIMEType   string    `gorm:"size:64;not null;check:chk_media_assets_mime,mime_type IN ('image/jpeg','image/png','image/webp','image/gif','video/mp4','video/webm','video/quicktime')"`
+	SizeBytes  int64     `gorm:"not null;check:chk_media_assets_size,size_bytes > 0 AND size_bytes <= 268435456"`
 	SHA256     string    `gorm:"size:64;not null;check:chk_media_assets_sha,length(sha256) = 64"`
 	CreatedAt  time.Time `gorm:"not null"`
 }
 
 func (mediaAssetModel) TableName() string { return "media_assets" }
+
+// mediaUploadTicketModel 保存上游视频 PUT 票据的不可逆摘要与一次性消费状态。
+// 明文 token 永不落库；校验时对路径 token 再哈希比对。
+type mediaUploadTicketModel struct {
+	TokenHash   string    `gorm:"size:64;primaryKey;check:chk_media_upload_tickets_token_hash,length(token_hash) = 64"`
+	AssetID     string    `gorm:"size:64;not null;uniqueIndex;check:chk_media_upload_tickets_asset_id,length(trim(asset_id)) BETWEEN 16 AND 64"`
+	JobID       string    `gorm:"size:64;not null;index;check:chk_media_upload_tickets_job_id,length(trim(job_id)) BETWEEN 1 AND 64"`
+	MaxBytes    int64     `gorm:"not null;check:chk_media_upload_tickets_max_bytes,max_bytes > 0 AND max_bytes <= 268435456"`
+	AllowedMIME string    `gorm:"size:128;not null;default:'video/mp4';check:chk_media_upload_tickets_mime,length(trim(allowed_mime)) BETWEEN 1 AND 128"`
+	ExpiresAt   time.Time `gorm:"not null"`
+	ConsumedAt  *time.Time
+	CreatedAt   time.Time `gorm:"not null"`
+}
+
+func (mediaUploadTicketModel) TableName() string { return "media_upload_tickets" }
 
 type runtimeSettingsModel struct {
 	Key       string    `gorm:"size:64;primaryKey;check:chk_runtime_settings_key,length(trim(key)) BETWEEN 1 AND 64"`
@@ -406,20 +467,82 @@ type runtimeSettingsModel struct {
 
 func (runtimeSettingsModel) TableName() string { return "runtime_settings" }
 
+type egressSubscriptionSourceModel struct {
+	ID                     uint64 `gorm:"primaryKey;autoIncrement"`
+	Name                   string `gorm:"size:160;not null;uniqueIndex;check:chk_egress_subscription_sources_name,length(trim(name)) BETWEEN 1 AND 160"`
+	Scope                  string `gorm:"size:32;not null;check:chk_egress_subscription_sources_scope,scope IN ('grok_build','grok_web','grok_console','grok_web_asset')"`
+	Enabled                bool   `gorm:"not null;default:true"`
+	EncryptedURL           string `gorm:"type:text;not null;default:'';check:chk_egress_subscription_sources_url,length(encrypted_url) <= 65536"`
+	RefreshIntervalSeconds int    `gorm:"not null;default:900;check:chk_egress_subscription_sources_refresh,refresh_interval_seconds BETWEEN 60 AND 86400"`
+	DefaultAccountCapacity int    `gorm:"not null;default:0;check:chk_egress_subscription_sources_capacity,default_account_capacity BETWEEN 0 AND 100000"`
+	LastSyncedAt           *time.Time
+	NextSyncAt             *time.Time `gorm:"index:idx_egress_subscription_sources_due"`
+	LastSyncImported       int        `gorm:"not null;default:0;check:chk_egress_subscription_sources_imported,last_sync_imported >= 0"`
+	LastSyncError          string     `gorm:"size:512;not null;default:'';check:chk_egress_subscription_sources_error,length(last_sync_error) <= 512"`
+	CreatedAt              time.Time  `gorm:"not null"`
+	UpdatedAt              time.Time  `gorm:"not null"`
+}
+
+func (egressSubscriptionSourceModel) TableName() string { return "egress_subscription_sources" }
+
 type egressNodeModel struct {
-	ID                        uint64  `gorm:"primaryKey;autoIncrement"`
-	Name                      string  `gorm:"size:160;not null;check:chk_egress_nodes_name,length(trim(name)) BETWEEN 1 AND 160"`
-	Scope                     string  `gorm:"size:32;not null;check:chk_egress_nodes_specific_scope,scope IN ('grok_build','grok_web','grok_console','grok_web_asset')"`
-	Enabled                   bool    `gorm:"not null;default:true"`
-	EncryptedProxyURL         string  `gorm:"type:text;not null;default:'';check:chk_egress_nodes_proxy_url,length(encrypted_proxy_url) <= 65536"`
-	UserAgent                 string  `gorm:"size:512;not null;default:'';check:chk_egress_nodes_user_agent,length(user_agent) <= 512"`
-	EncryptedCloudflareCookie string  `gorm:"type:text;not null;default:'';check:chk_egress_nodes_cf_cookie,length(encrypted_cloudflare_cookie) <= 65536"`
-	Health                    float64 `gorm:"not null;default:1;check:chk_egress_nodes_health,health >= 0 AND health <= 1"`
-	FailureCount              int     `gorm:"not null;default:0;check:chk_egress_nodes_failures,failure_count >= 0"`
-	CooldownUntil             *time.Time
-	LastError                 string    `gorm:"size:512;check:chk_egress_nodes_last_error,length(last_error) <= 512"`
-	CreatedAt                 time.Time `gorm:"not null"`
-	UpdatedAt                 time.Time `gorm:"not null"`
+	ID                          uint64  `gorm:"primaryKey;autoIncrement"`
+	Name                        string  `gorm:"size:160;not null;check:chk_egress_nodes_name,length(trim(name)) BETWEEN 1 AND 160"`
+	Scope                       string  `gorm:"size:32;not null;check:chk_egress_nodes_specific_scope,scope IN ('grok_build','grok_web','grok_console','grok_web_asset')"`
+	Enabled                     bool    `gorm:"not null;default:true"`
+	ProxyPool                   bool    `gorm:"not null;default:false"`
+	SourceID                    *uint64 `gorm:"uniqueIndex:uidx_egress_nodes_source_key,priority:1;index:idx_egress_nodes_source;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
+	SourceKey                   string  `gorm:"size:64;not null;default:'';uniqueIndex:uidx_egress_nodes_source_key,priority:2;check:chk_egress_nodes_source_key,length(source_key) <= 64"`
+	AccountCapacity             int     `gorm:"not null;default:0;check:chk_egress_nodes_capacity,account_capacity BETWEEN 0 AND 100000"`
+	EncryptedProxyURL           string  `gorm:"type:text;not null;default:'';check:chk_egress_nodes_proxy_url,length(encrypted_proxy_url) <= 65536"`
+	UserAgent                   string  `gorm:"size:512;not null;default:'';check:chk_egress_nodes_user_agent,length(user_agent) <= 512"`
+	EncryptedCloudflareCookie   string  `gorm:"type:text;not null;default:'';check:chk_egress_nodes_cf_cookie,length(encrypted_cloudflare_cookie) <= 65536"`
+	ClearanceRefreshedAt        *time.Time
+	ClearanceFingerprint        string  `gorm:"size:64;not null;default:'';check:chk_egress_nodes_clearance_fingerprint,length(clearance_fingerprint) IN (0, 64)"`
+	ClearanceBindingFingerprint string  `gorm:"size:64;not null;default:'';check:chk_egress_nodes_clearance_binding_fingerprint,length(clearance_binding_fingerprint) IN (0, 64)"`
+	Health                      float64 `gorm:"not null;default:1;check:chk_egress_nodes_health,health >= 0 AND health <= 1"`
+	FailureCount                int     `gorm:"not null;default:0;check:chk_egress_nodes_failures,failure_count >= 0"`
+	CooldownUntil               *time.Time
+	LastError                   string `gorm:"size:512;check:chk_egress_nodes_last_error,length(last_error) <= 512"`
+	ProbeStatus                 string `gorm:"size:16;not null;default:unknown;check:chk_egress_nodes_probe_status,probe_status IN ('unknown','healthy','unhealthy')"`
+	LastProbedAt                *time.Time
+	ProbeLatencyMS              int                            `gorm:"not null;default:0;check:chk_egress_nodes_probe_latency,probe_latency_ms >= 0"`
+	ExitIP                      string                         `gorm:"size:64;not null;default:'';check:chk_egress_nodes_exit_ip,length(exit_ip) <= 64"`
+	ProbeError                  string                         `gorm:"size:512;not null;default:'';check:chk_egress_nodes_probe_error,length(probe_error) <= 512"`
+	ProbeProvider               string                         `gorm:"size:16;not null;default:'';check:chk_egress_nodes_probe_provider,probe_provider IN ('','ipinfo','cloudflare')"`
+	IPv4ProbeStatus             string                         `gorm:"column:ipv4_probe_status;size:16;not null;default:unknown;check:chk_egress_nodes_ipv4_probe_status,ipv4_probe_status IN ('unknown','healthy','unhealthy')"`
+	IPv4LastProbedAt            *time.Time                     `gorm:"column:ipv4_last_probed_at"`
+	IPv4ProbeLatencyMS          int                            `gorm:"column:ipv4_probe_latency_ms;not null;default:0;check:chk_egress_nodes_ipv4_probe_latency,ipv4_probe_latency_ms >= 0"`
+	IPv4ExitIP                  string                         `gorm:"column:ipv4_exit_ip;size:64;not null;default:'';check:chk_egress_nodes_ipv4_exit_ip,length(ipv4_exit_ip) <= 64"`
+	IPv4ProbeError              string                         `gorm:"column:ipv4_probe_error;size:512;not null;default:'';check:chk_egress_nodes_ipv4_probe_error,length(ipv4_probe_error) <= 512"`
+	IPv6ProbeStatus             string                         `gorm:"column:ipv6_probe_status;size:16;not null;default:unknown;check:chk_egress_nodes_ipv6_probe_status,ipv6_probe_status IN ('unknown','healthy','unhealthy')"`
+	IPv6LastProbedAt            *time.Time                     `gorm:"column:ipv6_last_probed_at"`
+	IPv6ProbeLatencyMS          int                            `gorm:"column:ipv6_probe_latency_ms;not null;default:0;check:chk_egress_nodes_ipv6_probe_latency,ipv6_probe_latency_ms >= 0"`
+	IPv6ExitIP                  string                         `gorm:"column:ipv6_exit_ip;size:64;not null;default:'';check:chk_egress_nodes_ipv6_exit_ip,length(ipv6_exit_ip) <= 64"`
+	IPv6ProbeError              string                         `gorm:"column:ipv6_probe_error;size:512;not null;default:'';check:chk_egress_nodes_ipv6_probe_error,length(ipv6_probe_error) <= 512"`
+	CreatedAt                   time.Time                      `gorm:"not null"`
+	UpdatedAt                   time.Time                      `gorm:"not null"`
+	Source                      *egressSubscriptionSourceModel `gorm:"foreignKey:SourceID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
 }
 
 func (egressNodeModel) TableName() string { return "egress_nodes" }
+
+type egressOperationsConfigModel struct {
+	ID                        uint64    `gorm:"primaryKey;check:chk_egress_operations_config_id,id = 1"`
+	ProbeProvider             string    `gorm:"size:16;not null;default:cloudflare;check:chk_egress_operations_config_probe_provider,probe_provider IN ('ipinfo','cloudflare')"`
+	ProbeIntervalSeconds      int       `gorm:"not null;default:900;check:chk_egress_operations_config_probe_interval,probe_interval_seconds BETWEEN 60 AND 86400"`
+	AutoAssignEnabled         bool      `gorm:"not null;default:false"`
+	AutoBalanceEnabled        bool      `gorm:"not null;default:false"`
+	AssignmentIntervalSeconds int       `gorm:"not null;default:300;check:chk_egress_operations_config_assignment_interval,assignment_interval_seconds BETWEEN 60 AND 86400"`
+	BuildFallbackMode         string    `gorm:"size:16;not null;default:none"`
+	BuildFallbackNodeID       uint64    `gorm:"not null;default:0"`
+	WebFallbackMode           string    `gorm:"size:16;not null;default:none"`
+	WebFallbackNodeID         uint64    `gorm:"not null;default:0"`
+	ConsoleFallbackMode       string    `gorm:"size:16;not null;default:none"`
+	ConsoleFallbackNodeID     uint64    `gorm:"not null;default:0"`
+	WebAssetFallbackMode      string    `gorm:"size:16;not null;default:none"`
+	WebAssetFallbackNodeID    uint64    `gorm:"not null;default:0"`
+	UpdatedAt                 time.Time `gorm:"not null"`
+}
+
+func (egressOperationsConfigModel) TableName() string { return "egress_operations_config" }

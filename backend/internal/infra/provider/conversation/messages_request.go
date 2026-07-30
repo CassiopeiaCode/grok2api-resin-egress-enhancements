@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+const anthropicBillingHeaderPrefix = "x-anthropic-billing-header: "
+
 func convertMessagesRequest(body []byte, model string) ([]byte, ResponseOptions, error) {
 	var request anthropicRequest
 	if err := json.Unmarshal(body, &request); err != nil {
@@ -87,9 +89,7 @@ func convertMessagesRequest(body []byte, model string) ([]byte, ResponseOptions,
 		switch effort {
 		case "minimal":
 			effort = "low"
-		case "max", "xhigh":
-			effort = "high"
-		case "low", "medium", "high":
+		case "low", "medium", "high", "xhigh", "max":
 		default:
 			return nil, ResponseOptions{}, fmt.Errorf("不支持 output_config.effort=%q", effort)
 		}
@@ -308,7 +308,9 @@ func convertAnthropicMessages(messages []anthropicMessage, declaredTools map[str
 				if json.Unmarshal(block["data"], &data) != nil || data == "" {
 					return nil, nil, fmt.Errorf("%s.data 无效", path)
 				}
-				input = append(input, map[string]any{"type": "reasoning", "encrypted_content": data})
+				// Grok Build requires summary to exist whenever encrypted_content is replayed.
+				// An empty array is the canonical Anthropic redacted_thinking representation.
+				input = append(input, map[string]any{"type": "reasoning", "summary": []any{}, "encrypted_content": data})
 			case "server_tool_use":
 				if role != "assistant" {
 					continue
@@ -386,6 +388,9 @@ func anthropicSystemText(raw json.RawMessage) (string, error) {
 	}
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
+		if isAnthropicBillingHeaderText(text) {
+			return "", nil
+		}
 		return text, nil
 	}
 	var blocks []struct {
@@ -400,9 +405,18 @@ func anthropicSystemText(raw json.RawMessage) (string, error) {
 		if block.Type != "text" {
 			return "", fmt.Errorf("system 不支持 type=%q", block.Type)
 		}
+		// Claude Code identity blocks may carry a per-request cch fingerprint and are not model instructions.
+		// Keeping them during Build conversion changes the cache prefix each turn and reduces cache hits.
+		if isAnthropicBillingHeaderText(block.Text) {
+			continue
+		}
 		parts = append(parts, block.Text)
 	}
 	return strings.Join(parts, "\n\n"), nil
+}
+
+func isAnthropicBillingHeaderText(text string) bool {
+	return strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), anthropicBillingHeaderPrefix)
 }
 
 func anthropicImageURL(raw json.RawMessage) (string, error) {
@@ -500,7 +514,7 @@ func anthropicToolResult(raw json.RawMessage, declaredTools map[string]struct{})
 			if err != nil {
 				return nil, err
 			}
-			parts = append(parts, map[string]any{"type": "input_image", "image_url": imageURL})
+			parts = append(parts, map[string]any{"type": "input_image", "detail": "auto", "image_url": imageURL})
 		case "document":
 			document, err := anthropicDocument(block)
 			if err != nil {
@@ -516,8 +530,8 @@ func anthropicToolResult(raw json.RawMessage, declaredTools map[string]struct{})
 			if _, exists := declaredTools[toolName]; !exists {
 				return nil, fmt.Errorf("tool_reference 引用了未声明的工具 %q", toolName)
 			}
-			// Responses 没有 Anthropic tool_reference 内容块。Messages 请求中的全部
-			// 工具定义已发送给上游，因此用确定性的结果文本保留“搜索命中”语义。
+			// Responses has no Anthropic tool_reference content block. All tool definitions from Messages
+			// have already been sent upstream, so deterministic result text preserves the search-hit meaning.
 			parts = append(parts, map[string]any{
 				"type": "input_text",
 				"text": fmt.Sprintf("Tool search matched declared tool %q; its definition is available in this request.", toolName),
@@ -691,11 +705,11 @@ func convertAnthropicWebSearchTool(tool map[string]json.RawMessage, index int) (
 			}
 			converted["filters"] = map[string]any{"allowed_domains": value}
 		case "max_uses", "blocked_domains", "user_location", "search_context_size":
-			// Build 0.2.101 只支持 allowed_domains；其余 Anthropic
-			// 可选控制字段不转发，避免上游因未知参数拒绝整个请求。
+			// Build 0.2.110 supports only allowed_domains. Do not forward other optional Anthropic controls,
+			// preventing unknown parameters from causing the upstream to reject the request.
 			continue
 		default:
-			// 对未来新增的 hosted-tool 可选字段保持向前兼容。
+			// Preserve forward compatibility with future hosted-tool optional fields.
 			continue
 		}
 	}
@@ -747,8 +761,8 @@ func convertAnthropicToolChoice(choice anthropicToolChoice, hasHostedWebSearch b
 		if strings.TrimSpace(choice.Name) == "" {
 			return nil, false, errors.New("tool_choice.tool 缺少 name")
 		}
-		// Claude Code secondary search forces name=web_search (hosted). Build accepts
-		// hosted tool_choice only as "required" when a single hosted tool remains.
+		// Claude Code secondary search uses a hosted tool with name=web_search.
+		// When only one hosted tool remains, Grok Build accepts only required tool_choice.
 		if hasHostedWebSearch && strings.EqualFold(strings.TrimSpace(choice.Name), "web_search") {
 			return "required", parallel, nil
 		}

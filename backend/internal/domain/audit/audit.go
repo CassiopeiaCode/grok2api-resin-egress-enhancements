@@ -5,12 +5,13 @@ import "time"
 type Operation string
 
 const (
-	OperationResponses Operation = "responses"
-	OperationChat      Operation = "chat"
-	OperationMessages  Operation = "messages"
-	OperationImage     Operation = "image"
-	OperationImageEdit Operation = "image_edit"
-	OperationVideo     Operation = "video"
+	OperationResponses  Operation = "responses"
+	OperationCompaction Operation = "compaction"
+	OperationChat       Operation = "chat"
+	OperationMessages   Operation = "messages"
+	OperationImage      Operation = "image"
+	OperationImageEdit  Operation = "image_edit"
+	OperationVideo      Operation = "video"
 )
 
 type UsageSource string
@@ -101,6 +102,7 @@ type Record struct {
 	NumServerSideToolsUsed  int64
 	ContextInputTokens      int64
 	ContextOutputTokens     int64
+	FirstTokenMS            *int64
 	DurationMS              int64
 	ErrorCode               string
 	AttemptCount            int

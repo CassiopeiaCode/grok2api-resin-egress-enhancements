@@ -335,6 +335,9 @@ func TestAccountRepositoryPersistsObservedBuildBillingFields(t *testing.T) {
 	if err := repo.UpdateObservedModel(context.Background(), credential.ID, "grok-4.5-build-free", now); err != nil {
 		t.Fatal(err)
 	}
+	if err := repo.UpdateObservedModel(context.Background(), credential.ID, "grok-4.5-build-free", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	if err := repo.SaveBilling(context.Background(), account.Billing{AccountID: credential.ID, IsUnifiedBillingUser: true, OnDemandEnabled: &onDemandEnabled, TopUpMethod: "TOP_UP_METHOD_SAVED_PAYMENT_METHOD", UsagePeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsagePeriodStart: "2026-07-12T00:00:00Z", UsagePeriodEnd: "2026-07-19T00:00:00Z", History: []account.BillingHistoryEntry{{Year: 2026, Month: 6}}, SyncedAt: now}); err != nil {
 		t.Fatal(err)
 	}
@@ -342,9 +345,36 @@ func TestAccountRepositoryPersistsObservedBuildBillingFields(t *testing.T) {
 	if err != nil || storedCredential.ObservedModel != "grok-4.5-build-free" || storedCredential.ObservedModelAt == nil {
 		t.Fatalf("credential = %#v, err = %v", storedCredential, err)
 	}
+	if !storedCredential.ObservedModelAt.Equal(now) {
+		t.Fatalf("unchanged observed model refreshed early at %v, want %v", storedCredential.ObservedModelAt, now)
+	}
 	billing, err := repo.GetBilling(context.Background(), credential.ID)
 	if err != nil || !billing.IsUnifiedBillingUser || billing.OnDemandEnabled == nil || *billing.OnDemandEnabled || billing.TopUpMethod != "TOP_UP_METHOD_SAVED_PAYMENT_METHOD" || billing.UsagePeriodType != "USAGE_PERIOD_TYPE_WEEKLY" || billing.UsagePeriodEnd != "2026-07-19T00:00:00Z" || len(billing.History) != 1 {
 		t.Fatalf("billing = %#v, err = %v", billing, err)
+	}
+}
+
+func TestAccountRepositoryRejectsStaleObservedModelWrite(t *testing.T) {
+	database := openTestDatabase(t)
+	repo := NewAccountRepository(database)
+	credential, _, err := repo.UpsertByIdentity(context.Background(), account.Credential{Provider: account.ProviderBuild, Name: "observed-order", SourceKey: "observed-order", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	older := time.Now().UTC()
+	newer := older.Add(time.Minute)
+	if updated, err := repo.UpdateObservedModelIfNewer(context.Background(), credential.ID, "grok-newer", newer); err != nil || !updated {
+		t.Fatalf("newer observed model update = %v, err = %v", updated, err)
+	}
+	if updated, err := repo.UpdateObservedModelIfNewer(context.Background(), credential.ID, "grok-older", older); err != nil || updated {
+		t.Fatalf("stale observed model update = %v, err = %v", updated, err)
+	}
+	stored, err := repo.Get(context.Background(), credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ObservedModel != "grok-newer" || stored.ObservedModelAt == nil || !stored.ObservedModelAt.Equal(newer) {
+		t.Fatalf("observed model after stale write = %q at %v", stored.ObservedModel, stored.ObservedModelAt)
 	}
 }
 
@@ -429,12 +459,20 @@ func TestFreshSchemaContract(t *testing.T) {
 			t.Fatalf("missing table for %T", model)
 		}
 	}
-	assertTableColumns(t, database, "provider_accounts", []string{"provider", "source_key", "auth_status"}, []string{"oidc_client_id", "expires_at", "encrypted_access_token", "encrypted_refresh_token"})
-	assertTableColumns(t, database, "account_credentials", []string{"account_id", "auth_type", "client_id", "encrypted_primary", "encrypted_refresh", "expires_at", "refresh_due_at", "last_refresh_at", "refresh_failures", "last_refresh_error", "refresh_permanent"}, nil)
+	assertTableColumns(t, database, "provider_accounts", []string{"provider", "source_key", "auth_status", "build_api_fallback", "build_route_mode", "build_super_entitled"}, []string{"oidc_client_id", "expires_at", "encrypted_access_token", "encrypted_refresh_token"})
+	assertTableColumns(t, database, "account_credentials", []string{"account_id", "auth_type", "client_id", "encrypted_primary", "encrypted_refresh", "expires_at", "refresh_due_at", "last_refresh_at", "refresh_failures", "last_refresh_error_status", "last_refresh_error", "last_refresh_error_message", "last_refresh_error_response", "refresh_permanent"}, nil)
+	assertTableColumns(t, database, "web_account_profiles", []string{"account_id", "tier", "synced_at", "nsfw_enabled_at"}, nil)
 	assertTableColumns(t, database, "admin_sessions", nil, []string{"revoked_at"})
 	assertTableColumns(t, database, "account_model_capabilities", []string{"account_id", "upstream_model"}, []string{"provider", "synced_at"})
-	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds"}, nil)
-	assertTableColumns(t, database, "response_ownership", []string{"response_id", "account_id", "client_key_id", "provider", "expires_at"}, []string{"parent_response_id", "model_route_id"})
+	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds", "first_token_ms"}, nil)
+	assertTableColumns(t, database, "response_ownership", []string{"response_id", "account_id", "client_key_id", "provider", "prompt_cache_key", "reasoning_replay_key", "expires_at"}, []string{"parent_response_id", "model_route_id"})
+	var requestAuditSQL string
+	if err := database.db.Raw("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'request_audits'").Scan(&requestAuditSQL).Error; err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(requestAuditSQL, "chk_request_audits_first_token_ms") {
+		t.Fatalf("first-token observability metadata must not require a table-level CHECK: %s", requestAuditSQL)
+	}
 
 	var expiresNotNull int
 	if err := database.db.Raw("SELECT `notnull` FROM pragma_table_info('account_credentials') WHERE name = 'expires_at'").Scan(&expiresNotNull).Error; err != nil {

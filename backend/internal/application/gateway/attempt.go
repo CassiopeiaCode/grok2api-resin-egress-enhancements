@@ -19,6 +19,7 @@ import (
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
 type failureAttemptRecorder struct {
@@ -144,6 +145,30 @@ func (r *failureAttemptRecorder) captureResponse(credential accountdomain.Creden
 		ResponseBodyTruncated: bodyTruncated,
 	})
 	return nil
+}
+
+func (r *failureAttemptRecorder) captureStreamFailure(credential accountdomain.Credential, startedAt time.Time, response *provider.Response, diagnostic StreamFailureDiagnostic) {
+	if response == nil {
+		return
+	}
+	statusCode := response.StatusCode
+	body, bodyTruncated := r.captureBody(diagnostic.Body, diagnostic.BodyTruncated)
+	r.append(audit.Attempt{
+		Source:                audit.AttemptSourceUpstreamHTTP,
+		Stage:                 "response_stream",
+		AccountID:             auditAccountID(credential.ID),
+		AccountName:           credential.Name,
+		Method:                r.method,
+		RequestPath:           r.path,
+		UpstreamURL:           sanitizeUpstreamURL(response.UpstreamURL),
+		StartedAt:             startedAt.UTC(),
+		DurationMS:            time.Since(startedAt).Milliseconds(),
+		UpstreamStatusCode:    &statusCode,
+		UpstreamStatus:        response.Status,
+		ResponseHeaders:       sanitizeDiagnosticHeaders(response.Header),
+		ResponseBody:          body,
+		ResponseBodyTruncated: bodyTruncated,
+	})
 }
 
 func (r *failureAttemptRecorder) append(attempt audit.Attempt) {
@@ -323,6 +348,8 @@ func errorUpstreamURL(err error) string {
 
 func transportStage(err error) string {
 	switch {
+	case neterrorpkg.IsResponseHeaderTimeout(err):
+		return "response_header_timeout"
 	case errors.Is(err, context.Canceled):
 		return "request_canceled"
 	case errors.Is(err, context.DeadlineExceeded):

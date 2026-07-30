@@ -14,15 +14,24 @@ import (
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/pkg/perfmetrics"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	redisclient "github.com/redis/go-redis/v9"
 )
 
 const (
-	concurrencyLeaseGrace       = time.Minute
-	maxStickyBindingsPerAccount = 10000
-	maxDeviceSessions           = 1000
-	maxQuotaRecoveryEvents      = 100000
+	concurrencyLeaseGrace                = time.Minute
+	concurrencyReleaseRetryInterval      = 250 * time.Millisecond
+	concurrencyReleaseRetryTimeout       = 3 * time.Second
+	concurrencyReleaseRetryBatchSize     = 512
+	concurrencyReleaseRetryQueueCapacity = 16384
+	maxStickyBindingsPerAccount          = 10000
+	maxDeviceSessions                    = 1000
+	maxQuotaRecoveryEvents               = 100000
+	maxQuotaRefreshDirty                 = 100000
+	observedModelStateTTL                = 30 * time.Minute
+	// At the per-account cap, one pipeline processes at most 80,000 members.
+	stickyDeletePipelineSize = 8
 )
 
 var rateScript = redisclient.NewScript(`
@@ -63,6 +72,25 @@ if excess > 0 then
 end
 if redis.call('PTTL', KEYS[2]) < tonumber(ARGV[2]) then redis.call('PEXPIRE', KEYS[2], ARGV[2]) end
 return 1
+`)
+
+var bindStickyScript = redisclient.NewScript(`
+local selected = redis.call('GET', KEYS[1])
+if not selected then selected = ARGV[1] end
+local accountSetKey = ARGV[3] .. selected
+redis.call('SET', KEYS[1], selected, 'PX', ARGV[2])
+redis.call('ZREMRANGEBYSCORE', accountSetKey, '-inf', ARGV[4])
+redis.call('ZADD', accountSetKey, ARGV[5], KEYS[1])
+local excess = redis.call('ZCARD', accountSetKey) - tonumber(ARGV[6])
+if excess > 0 then
+  local stale = redis.call('ZRANGE', accountSetKey, 0, excess - 1)
+  for _, key in ipairs(stale) do
+    if redis.call('GET', key) == selected then redis.call('DEL', key) end
+    redis.call('ZREM', accountSetKey, key)
+  end
+end
+if redis.call('PTTL', accountSetKey) < tonumber(ARGV[2]) then redis.call('PEXPIRE', accountSetKey, ARGV[2]) end
+return selected
 `)
 
 var deleteStickyByAccountScript = redisclient.NewScript(`
@@ -135,6 +163,103 @@ redis.call('HDEL', KEYS[3], ARGV[1])
 return redis.call('ZREM', KEYS[1], ARGV[1])
 `)
 
+var markQuotaRefreshDirtyScript = redisclient.NewScript(`
+local now = tonumber(ARGV[4])
+local expired = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now, 'LIMIT', 0, 1000)
+for _, member in ipairs(expired) do
+  redis.call('ZREM', KEYS[3], member)
+  redis.call('ZREM', KEYS[2], member)
+  redis.call('HDEL', KEYS[1], member)
+end
+local memberExpires = redis.call('ZSCORE', KEYS[3], ARGV[1])
+if memberExpires and tonumber(memberExpires) <= now then
+  redis.call('ZREM', KEYS[3], ARGV[1])
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  redis.call('HDEL', KEYS[1], ARGV[1])
+end
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+if not redis.call('ZSCORE', KEYS[2], ARGV[1]) and redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[3]) then return 0 end
+local generation = redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
+redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
+redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1])
+local latest = redis.call('ZREVRANGE', KEYS[3], 0, 0, 'WITHSCORES')
+if #latest == 2 then
+  redis.call('PEXPIREAT', KEYS[1], latest[2])
+  redis.call('PEXPIREAT', KEYS[2], latest[2])
+  redis.call('PEXPIREAT', KEYS[3], latest[2])
+end
+return generation
+`)
+
+var clearQuotaRefreshDirtyScript = redisclient.NewScript(`
+local retentionExpires = redis.call('ZSCORE', KEYS[3], ARGV[1])
+if not retentionExpires or tonumber(retentionExpires) <= tonumber(ARGV[3]) then
+  redis.call('ZREM', KEYS[3], ARGV[1])
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  redis.call('HDEL', KEYS[1], ARGV[1])
+  return 0
+end
+local dirtyExpires = redis.call('ZSCORE', KEYS[2], ARGV[1])
+if not dirtyExpires or tonumber(dirtyExpires) <= tonumber(ARGV[3]) then
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  return 0
+end
+if tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '0') ~= tonumber(ARGV[2]) then return 0 end
+redis.call('ZREM', KEYS[2], ARGV[1])
+return 1
+`)
+
+var listQuotaRefreshDirtyScript = redisclient.NewScript(`
+local limit = tonumber(ARGV[2])
+local now = tonumber(ARGV[1])
+local expired = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now, 'LIMIT', 0, 1000)
+for _, member in ipairs(expired) do
+  redis.call('ZREM', KEYS[3], member)
+  redis.call('ZREM', KEYS[2], member)
+  redis.call('HDEL', KEYS[1], member)
+end
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+local members = redis.call('ZRANGEBYSCORE', KEYS[2], '(' .. ARGV[1], '+inf', 'LIMIT', 0, limit)
+local result = {}
+for _, member in ipairs(members) do
+  local retentionExpires = redis.call('ZSCORE', KEYS[3], member)
+  local generation = redis.call('HGET', KEYS[1], member)
+  if retentionExpires and tonumber(retentionExpires) > now and generation then
+    table.insert(result, member)
+    table.insert(result, generation)
+  end
+end
+return result
+`)
+
+var setObservedModelStateScript = redisclient.NewScript(`
+local previous = redis.call('HGET', KEYS[1], 'observed_at')
+if previous and tonumber(previous) > tonumber(ARGV[2]) then return 0 end
+redis.call('HSET', KEYS[1], 'model', ARGV[1], 'observed_at', ARGV[2])
+redis.call('PEXPIRE', KEYS[1], ARGV[3])
+return 1
+`)
+
+var quotaRefreshStateScript = redisclient.NewScript(`
+local generation = redis.call('HGET', KEYS[1], ARGV[1]) or '0'
+local retentionExpires = redis.call('ZSCORE', KEYS[3], ARGV[1])
+if not retentionExpires or tonumber(retentionExpires) <= tonumber(ARGV[2]) then
+  redis.call('ZREM', KEYS[3], ARGV[1])
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  redis.call('HDEL', KEYS[1], ARGV[1])
+  generation = '0'
+  return {generation, '0'}
+end
+local dirtyExpires = redis.call('ZSCORE', KEYS[2], ARGV[1])
+local dirty = '0'
+if dirtyExpires and tonumber(dirtyExpires) > tonumber(ARGV[2]) then
+  dirty = '1'
+elseif dirtyExpires then
+  redis.call('ZREM', KEYS[2], ARGV[1])
+end
+return {generation, dirty}
+`)
+
 var rescheduleQuotaRecoveryScript = redisclient.NewScript(`
 if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[4] then return 0 end
 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
@@ -156,9 +281,20 @@ type Config struct {
 
 // Store 实现多实例共享的限流、并发租约、粘滞路由、Device OAuth 会话和分布式锁。
 type Store struct {
-	client           *redisclient.Client
-	prefix           string
-	concurrencyLease time.Duration
+	client                  *redisclient.Client
+	prefix                  string
+	concurrencyLease        time.Duration
+	concurrencyReleaseQueue chan concurrencyReleaseRetry
+	concurrencyReleaseStop  chan struct{}
+	concurrencyReleaseDone  chan struct{}
+	closeOnce               sync.Once
+	closeErr                error
+}
+
+type concurrencyReleaseRetry struct {
+	redisKey  string
+	token     string
+	expiresAt time.Time
 }
 
 // Open 连接 Redis；选中的 Redis 不可用时直接返回启动错误。
@@ -176,18 +312,110 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if lease <= 0 {
 		lease = 3 * time.Hour
 	}
-	return &Store{client: client, prefix: cfg.KeyPrefix, concurrencyLease: lease}, nil
+	store := &Store{
+		client: client, prefix: cfg.KeyPrefix, concurrencyLease: lease,
+		concurrencyReleaseQueue: make(chan concurrencyReleaseRetry, concurrencyReleaseRetryQueueCapacity),
+		concurrencyReleaseStop:  make(chan struct{}), concurrencyReleaseDone: make(chan struct{}),
+	}
+	go store.runConcurrencyReleaseRetries()
+	return store, nil
 }
 
-func (s *Store) Close() error { return s.client.Close() }
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.concurrencyReleaseStop)
+		s.closeErr = s.client.Close()
+		<-s.concurrencyReleaseDone
+	})
+	return s.closeErr
+}
 
 func (s *Store) Ping(ctx context.Context) error { return s.client.Ping(ctx).Err() }
 
 func (s *Store) key(namespace, key string) string { return s.prefix + namespace + ":" + key }
 
+func (s *Store) GetObservedModelState(ctx context.Context, accountID uint64) (repository.ObservedModelState, bool, error) {
+	if accountID == 0 {
+		return repository.ObservedModelState{}, false, nil
+	}
+	values, err := s.client.HMGet(ctx, s.key("observed-model", strconv.FormatUint(accountID, 10)), "model", "observed_at").Result()
+	if err != nil {
+		return repository.ObservedModelState{}, false, err
+	}
+	if len(values) != 2 || values[0] == nil || values[1] == nil {
+		return repository.ObservedModelState{}, false, nil
+	}
+	model, ok := values[0].(string)
+	if !ok || strings.TrimSpace(model) == "" {
+		return repository.ObservedModelState{}, false, nil
+	}
+	observedMillis, err := strconv.ParseInt(fmt.Sprint(values[1]), 10, 64)
+	if err != nil || observedMillis <= 0 {
+		return repository.ObservedModelState{}, false, nil
+	}
+	return repository.ObservedModelState{Model: model, ObservedAt: time.UnixMilli(observedMillis).UTC()}, true, nil
+}
+
+func (s *Store) SetObservedModelState(ctx context.Context, accountID uint64, value repository.ObservedModelState, ttl time.Duration) error {
+	if accountID == 0 || strings.TrimSpace(value.Model) == "" || value.ObservedAt.IsZero() {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = observedModelStateTTL
+	}
+	return setObservedModelStateScript.Run(ctx, s.client,
+		[]string{s.key("observed-model", strconv.FormatUint(accountID, 10))},
+		strings.TrimSpace(value.Model), value.ObservedAt.UTC().UnixMilli(), ttl.Milliseconds()).Err()
+}
+
 // PublishSettingsChanged 发布运行设置失效通知，不在 Redis 中复制设置内容。
 func (s *Store) PublishSettingsChanged(ctx context.Context) error {
 	return s.client.Publish(ctx, s.key("events", "settings"), "reload").Err()
+}
+
+func (s *Store) PublishInvalidation(ctx context.Context, event repository.InvalidationEvent) error {
+	if !event.Valid() {
+		return errors.New("invalid invalidation event")
+	}
+	if event.PublishedAt.IsZero() {
+		event.PublishedAt = time.Now().UTC()
+	}
+	revision, err := s.client.Incr(ctx, s.key("invalidation-revision", string(event.Layer())+":"+string(event.Provider))).Result()
+	if err != nil {
+		return err
+	}
+	event.Revision = uint64(revision)
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	return s.client.Publish(ctx, s.key("events", "invalidation"), payload).Err()
+}
+
+func (s *Store) ListenInvalidations(ctx context.Context, handler func(context.Context, repository.InvalidationEvent) error) error {
+	pubsub := s.client.Subscribe(ctx, s.key("events", "invalidation"))
+	defer pubsub.Close()
+	if _, err := pubsub.Receive(ctx); err != nil {
+		return err
+	}
+	channel := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case message, ok := <-channel:
+			if !ok {
+				return errors.New("Redis invalidation channel closed")
+			}
+			var event repository.InvalidationEvent
+			if err := json.Unmarshal([]byte(message.Payload), &event); err != nil || !event.Valid() {
+				continue
+			}
+			if err := handler(ctx, event); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // ListenSettingsChanges 监听设置变更并调用重载函数，go-redis 会在连接中断后自动重连。
@@ -239,11 +467,102 @@ func (s *Store) acquireConcurrency(ctx context.Context, key string, limit int) (
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			releaseCtx, cancel := context.WithTimeout(context.Background(), concurrencyReleaseRetryTimeout)
 			defer cancel()
-			_ = releaseLeaseScript.Run(releaseCtx, s.client, []string{redisKey}, token).Err()
+			if err := releaseLeaseScript.Run(releaseCtx, s.client, []string{redisKey}, token).Err(); err != nil {
+				s.enqueueConcurrencyReleaseRetry(concurrencyReleaseRetry{redisKey: redisKey, token: token, expiresAt: expiresAt})
+			}
 		})
 	}, true, nil
+}
+
+func (s *Store) enqueueConcurrencyReleaseRetry(value concurrencyReleaseRetry) {
+	select {
+	case <-s.concurrencyReleaseStop:
+		observeConcurrencyRelease("shutdown", 1)
+		return
+	default:
+	}
+	select {
+	case s.concurrencyReleaseQueue <- value:
+		observeConcurrencyRelease("queued", 1)
+	case <-s.concurrencyReleaseStop:
+		observeConcurrencyRelease("shutdown", 1)
+	default:
+		observeConcurrencyRelease("dropped", 1)
+	}
+}
+
+func (s *Store) runConcurrencyReleaseRetries() {
+	defer close(s.concurrencyReleaseDone)
+	ticker := time.NewTicker(concurrencyReleaseRetryInterval)
+	defer ticker.Stop()
+	pending := make(map[string]concurrencyReleaseRetry)
+	for {
+		select {
+		case value := <-s.concurrencyReleaseQueue:
+			pending[value.token] = value
+		case <-ticker.C:
+			s.retryConcurrencyReleases(pending)
+		case <-s.concurrencyReleaseStop:
+			observeConcurrencyRelease("shutdown", len(pending)+len(s.concurrencyReleaseQueue))
+			return
+		}
+	}
+}
+
+func (s *Store) retryConcurrencyReleases(pending map[string]concurrencyReleaseRetry) {
+	if len(pending) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	expired := 0
+	ctx, cancel := context.WithTimeout(context.Background(), concurrencyReleaseRetryTimeout)
+	defer cancel()
+	pipeline := s.client.Pipeline()
+	type queuedRelease struct {
+		token   string
+		command *redisclient.IntCmd
+	}
+	commands := make([]queuedRelease, 0, min(len(pending), concurrencyReleaseRetryBatchSize))
+	for token, value := range pending {
+		if !now.Before(value.expiresAt) {
+			delete(pending, token)
+			expired++
+			continue
+		}
+		commands = append(commands, queuedRelease{token: token, command: pipeline.ZRem(ctx, value.redisKey, value.token)})
+		if len(commands) >= concurrencyReleaseRetryBatchSize {
+			break
+		}
+	}
+	if len(commands) == 0 {
+		observeConcurrencyRelease("expired", expired)
+		return
+	}
+	_, _ = pipeline.Exec(ctx)
+	recovered := 0
+	failed := 0
+	for _, value := range commands {
+		if value.command.Err() == nil {
+			delete(pending, value.token)
+			recovered++
+		} else {
+			failed++
+		}
+	}
+	observeConcurrencyRelease("expired", expired)
+	observeConcurrencyRelease("recovered", recovered)
+	observeConcurrencyRelease("retry_failed", failed)
+}
+
+func observeConcurrencyRelease(outcome string, count int) {
+	if count <= 0 {
+		return
+	}
+	perfmetrics.Default.Add("runtime_concurrency_release_total", perfmetrics.Labels{
+		Subsystem: "runtime", Operation: "concurrency_lease", Stage: "release", Outcome: outcome,
+	}, int64(count))
 }
 
 func (s *Store) Current(ctx context.Context, key string) (int, error) {
@@ -263,13 +582,12 @@ func (s *Store) CurrentMany(ctx context.Context, keys []string) (map[string]int,
 	if len(keys) == 0 {
 		return values, nil
 	}
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	now := "(" + strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	pipe := s.client.Pipeline()
 	counts := make(map[string]*redisclient.IntCmd, len(keys))
 	for _, key := range keys {
 		redisKey := s.key("concurrency", key)
-		pipe.ZRemRangeByScore(ctx, redisKey, "-inf", now)
-		counts[key] = pipe.ZCard(ctx, redisKey)
+		counts[key] = pipe.ZCount(ctx, redisKey, now, "+inf")
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, err
@@ -292,6 +610,32 @@ func (s *Store) Get(ctx context.Context, key string, now time.Time) (uint64, boo
 	return id, err == nil, err
 }
 
+func (s *Store) Bind(ctx context.Context, key string, proposedAccountID uint64, now, expiresAt time.Time) (uint64, error) {
+	if key == "" || proposedAccountID == 0 {
+		return proposedAccountID, nil
+	}
+	ttl := time.Until(expiresAt)
+	if ttl <= 0 {
+		return proposedAccountID, nil
+	}
+	id := strconv.FormatUint(proposedAccountID, 10)
+	value, err := bindStickyScript.Run(
+		ctx,
+		s.client,
+		[]string{s.key("sticky", key)},
+		id,
+		ttl.Milliseconds(),
+		s.prefix+"sticky-account:",
+		now.UnixMilli(),
+		expiresAt.UnixMilli(),
+		maxStickyBindingsPerAccount,
+	).Uint64()
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
 func (s *Store) Set(ctx context.Context, key string, accountID uint64, expiresAt time.Time) error {
 	ttl := time.Until(expiresAt)
 	if ttl <= 0 {
@@ -310,6 +654,38 @@ func (s *Store) DeleteByAccount(ctx context.Context, accountID uint64) error {
 	return deleteStickyByAccountScript.Run(ctx, s.client, []string{s.key("sticky-account", id)}, id).Err()
 }
 
+func (s *Store) DeleteByAccounts(ctx context.Context, accountIDs []uint64) error {
+	seen := make(map[uint64]struct{}, len(accountIDs))
+	ids := make([]uint64, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID == 0 {
+			continue
+		}
+		if _, exists := seen[accountID]; exists {
+			continue
+		}
+		seen[accountID] = struct{}{}
+		ids = append(ids, accountID)
+	}
+	for start := 0; start < len(ids); start += stickyDeletePipelineSize {
+		end := min(start+stickyDeletePipelineSize, len(ids))
+		_, err := s.client.Pipelined(ctx, func(pipe redisclient.Pipeliner) error {
+			for _, accountID := range ids[start:end] {
+				id := strconv.FormatUint(accountID, 10)
+				// EVAL avoids a NOSCRIPT fallback round trip inside the pipeline. Each
+				// script remains bounded to one account so bulk maintenance cannot
+				// monopolize the shared Redis event loop with one large Lua call.
+				deleteStickyByAccountScript.Eval(ctx, pipe, []string{s.key("sticky-account", id)}, id)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) ScheduleQuotaRecovery(ctx context.Context, value account.QuotaRecoveryEvent) error {
 	if value.AccountID == 0 || value.Mode == "" || value.DueAt.IsZero() {
 		return fmt.Errorf("额度恢复事件无效")
@@ -323,6 +699,79 @@ func (s *Store) ScheduleQuotaRecovery(ctx context.Context, value account.QuotaRe
 		return fmt.Errorf("额度恢复队列已满")
 	}
 	return nil
+}
+
+func (s *Store) MarkQuotaRefreshDirty(ctx context.Context, accountID uint64, mode string, ttl time.Duration) (uint64, error) {
+	mode = strings.TrimSpace(mode)
+	if accountID == 0 || mode == "" || ttl <= 0 {
+		return 0, fmt.Errorf("quota refresh identity is invalid")
+	}
+	member := strconv.FormatUint(accountID, 10) + ":" + mode
+	now := time.Now().UTC()
+	expiresAt := now.Add(ttl)
+	generation, err := markQuotaRefreshDirtyScript.Run(ctx, s.client,
+		[]string{s.key("quota-refresh", "generations"), s.key("quota-refresh", "dirty"), s.key("quota-refresh", "expiry")},
+		member, expiresAt.UnixMilli(), maxQuotaRefreshDirty, now.UnixMilli(),
+	).Uint64()
+	if err != nil {
+		return 0, err
+	}
+	if generation == 0 {
+		return 0, fmt.Errorf("quota refresh dirty set is full")
+	}
+	return generation, nil
+}
+
+func (s *Store) QuotaRefreshGeneration(ctx context.Context, accountID uint64, mode string) (uint64, bool, error) {
+	member := strconv.FormatUint(accountID, 10) + ":" + strings.TrimSpace(mode)
+	values, err := quotaRefreshStateScript.Run(ctx, s.client,
+		[]string{s.key("quota-refresh", "generations"), s.key("quota-refresh", "dirty"), s.key("quota-refresh", "expiry")}, member, time.Now().UTC().UnixMilli(),
+	).StringSlice()
+	if err != nil {
+		return 0, false, err
+	}
+	if len(values) != 2 {
+		return 0, false, fmt.Errorf("quota refresh state response is invalid")
+	}
+	generation, err := strconv.ParseUint(values[0], 10, 64)
+	return generation, values[1] == "1", err
+}
+
+func (s *Store) ClearQuotaRefreshDirty(ctx context.Context, accountID uint64, mode string, generation uint64) (bool, error) {
+	member := strconv.FormatUint(accountID, 10) + ":" + strings.TrimSpace(mode)
+	result, err := clearQuotaRefreshDirtyScript.Run(ctx, s.client,
+		[]string{s.key("quota-refresh", "generations"), s.key("quota-refresh", "dirty"), s.key("quota-refresh", "expiry")},
+		member, generation, time.Now().UTC().UnixMilli(),
+	).Int()
+	return result == 1, err
+}
+
+func (s *Store) ListQuotaRefreshDirty(ctx context.Context, now time.Time, limit int) ([]repository.QuotaRefreshDirty, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	values, err := listQuotaRefreshDirtyScript.Run(ctx, s.client,
+		[]string{s.key("quota-refresh", "generations"), s.key("quota-refresh", "dirty"), s.key("quota-refresh", "expiry")},
+		now.UnixMilli(), limit,
+	).StringSlice()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]repository.QuotaRefreshDirty, 0, min(limit, len(values)/2))
+	for index := 0; index+1 < len(values); index += 2 {
+		member := values[index]
+		separator := strings.IndexByte(member, ':')
+		if separator <= 0 || separator == len(member)-1 {
+			continue
+		}
+		accountID, parseErr := strconv.ParseUint(member[:separator], 10, 64)
+		generation, generationErr := strconv.ParseUint(values[index+1], 10, 64)
+		if parseErr != nil || generationErr != nil || accountID == 0 || generation == 0 {
+			continue
+		}
+		result = append(result, repository.QuotaRefreshDirty{AccountID: accountID, Mode: member[separator+1:], Generation: generation})
+	}
+	return result, nil
 }
 
 func (s *Store) EnsureQuotaRecovery(ctx context.Context, value account.QuotaRecoveryEvent) error {

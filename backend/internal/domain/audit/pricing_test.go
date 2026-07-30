@@ -12,7 +12,7 @@ func TestEstimateOfficialCostHandlesCacheAliasesAndLongContext(t *testing.T) {
 		t.Fatalf("composer result = %#v, ok = %v", result, ok)
 	}
 	result, ok = EstimateOfficialCost("grok-4.5", 1_000_000, 200_000, 500_000, 210_000)
-	if !ok || result.CostInUSDTicks != 94_000_000_000 {
+	if !ok || result.CostInUSDTicks != 93_200_000_000 {
 		t.Fatalf("long-context result = %#v, ok = %v", result, ok)
 	}
 	result, ok = EstimateOfficialCost("Web/grok-4.5-build-free", 100, 0, 50, 100)
@@ -53,7 +53,7 @@ func TestOfficialPricingMatchesPublishedTokenRates(t *testing.T) {
 		inputCost, cachedCost, outputCost int64
 	}{
 		{model: "grok-build-0.1", inputCost: 10_000_000_000, cachedCost: 2_000_000_000, outputCost: 20_000_000_000},
-		{model: "grok-4.5", inputCost: 20_000_000_000, cachedCost: 5_000_000_000, outputCost: 60_000_000_000},
+		{model: "grok-4.5", inputCost: 20_000_000_000, cachedCost: 3_000_000_000, outputCost: 60_000_000_000},
 		{model: "grok-4.3", inputCost: 12_500_000_000, cachedCost: 2_000_000_000, outputCost: 25_000_000_000},
 		{model: "grok-4.20-multi-agent-0309", inputCost: 12_500_000_000, cachedCost: 2_000_000_000, outputCost: 25_000_000_000},
 		{model: "grok-4.20-0309-reasoning", inputCost: 12_500_000_000, cachedCost: 2_000_000_000, outputCost: 25_000_000_000},
@@ -139,5 +139,39 @@ func TestEstimateOfficialVideoCost(t *testing.T) {
 	}
 	if result, ok = EstimateOfficialVideoCost("grok-imagine-video", "1080p", 10); ok || result.CostInUSDTicks != 0 {
 		t.Fatalf("unpriced video resolution = %#v, ok = %v", result, ok)
+	}
+
+	result, ok = EstimateOfficialVideoCost("grok-imagine-video-1.5", "720p", 6)
+	if !ok || result.Model != "grok-imagine-video-1.5-720p" || result.CostInUSDTicks != 8_400_000_000 {
+		t.Fatalf("1.5 720p video result = %#v, ok = %v", result, ok)
+	}
+	result, ok = EstimateOfficialVideoCost("Build/grok-imagine-video-1.5", "480p", 1)
+	if !ok || result.Model != "grok-imagine-video-1.5-480p" || result.CostInUSDTicks != 800_000_000 {
+		t.Fatalf("prefixed 1.5 video result = %#v, ok = %v", result, ok)
+	}
+	if result, ok = EstimateOfficialVideoCost("grok-imagine-video-1.5-fast", "720p", 6); ok || result.CostInUSDTicks != 0 {
+		t.Fatalf("unknown 1.5 suffix was priced = %#v, ok = %v", result, ok)
+	}
+	if result, ok = EstimateOfficialVideoCost("grok-imagine-video-2.0", "720p", 6); ok || result.CostInUSDTicks != 0 {
+		t.Fatalf("unknown video model was priced = %#v, ok = %v", result, ok)
+	}
+}
+
+func TestReconstructOfficialCostReturnsExactStoredFormulaInputs(t *testing.T) {
+	textResult, ok := ReconstructOfficialCost("grok-build-0.1", 100, 20, 50, 100, 0, 0, 0)
+	if !ok || textResult.Tier != PricingTierStandard || textResult.CostInUSDTicks != 1_840_000 || len(textResult.Components) != 3 {
+		t.Fatalf("text reconstruction = %#v, %v", textResult, ok)
+	}
+	longResult, ok := ReconstructOfficialCost("grok-build-0.1", 100, 20, 50, 200_001, 0, 0, 0)
+	if !ok || longResult.Tier != PricingTierLongContext || longResult.CostInUSDTicks != 3_680_000 {
+		t.Fatalf("long-context reconstruction = %#v, %v", longResult, ok)
+	}
+	imageResult, ok := ReconstructOfficialCost("grok-imagine-image-edit-2k", 0, 0, 0, 0, 2, 3, 0)
+	if !ok || imageResult.CostInUSDTicks != 2_300_000_000 || len(imageResult.Components) != 2 || imageResult.Components[1].Kind != PricingComponentInputImage {
+		t.Fatalf("image reconstruction = %#v, %v", imageResult, ok)
+	}
+	videoResult, ok := ReconstructOfficialCost("grok-imagine-video-1.5-720p", 0, 0, 0, 0, 1, 0, 6)
+	if !ok || videoResult.CostInUSDTicks != 8_400_000_000 || videoResult.Components[0].Unit != PricingUnitSecond {
+		t.Fatalf("video reconstruction = %#v, %v", videoResult, ok)
 	}
 }

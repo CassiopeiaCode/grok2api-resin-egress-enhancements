@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/pkg/perfmetrics"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -33,9 +35,14 @@ type CreateInput struct {
 	Enabled              bool
 	ExpiresAt            *time.Time
 	RPMLimit             int
+	RPMUnlimited         bool
 	MaxConcurrent        int
+	ConcurrencyUnlimited bool
 	BillingLimitUSDTicks int64
+	AllowModelAliases    bool
 	AllowedModels        []uint64
+	ProviderScope        clientkeydomain.ProviderScope
+	TierScope            clientkeydomain.TierScope
 }
 
 type UpdateInput struct {
@@ -46,7 +53,10 @@ type UpdateInput struct {
 	RPMLimit             *int
 	MaxConcurrent        *int
 	BillingLimitUSDTicks *int64
+	AllowModelAliases    *bool
 	AllowedModels        *[]uint64
+	ProviderScope        *clientkeydomain.ProviderScope
+	TierScope            *clientkeydomain.TierScope
 }
 
 type Created struct {
@@ -62,24 +72,26 @@ type ListFilter struct {
 
 // Service 负责下游 API Key 创建、鉴权和调用限制。
 type Service struct {
-	keys        repository.ClientKeyRepository
-	rateLimiter repository.RateLimiter
-	concurrency repository.ConcurrencyLimiter
-	defaultRPM  atomic.Int64
-	defaultMax  atomic.Int64
-	authCache   *authKeyCache
-	touches     *touchTracker
-	cipher      *security.Cipher
+	keys          repository.ClientKeyRepository
+	rateLimiter   repository.RateLimiter
+	concurrency   repository.ConcurrencyLimiter
+	defaultRPM    atomic.Int64
+	defaultMax    atomic.Int64
+	authCache     *authKeyCache
+	touches       *touchTracker
+	cipher        *security.Cipher
+	activeMu      sync.RWMutex
+	activeBilling map[string]struct{}
 }
 
 type billingReservationRepository interface {
 	ReserveBillingUsage(ctx context.Context, id uint64, eventID string, amount int64, expiresAt time.Time) (bool, error)
 	CancelBillingReservation(ctx context.Context, eventID string) error
-	CleanupExpiredBillingReservations(ctx context.Context, now time.Time, limit int) (int, error)
+	CleanupExpiredBillingReservations(ctx context.Context, now time.Time, limit int, protectedEventIDs ...[]string) (int, error)
 }
 
 func NewService(keys repository.ClientKeyRepository, rateLimiter repository.RateLimiter, concurrency repository.ConcurrencyLimiter, defaultRPM, defaultMax int, cipher *security.Cipher) *Service {
-	service := &Service{keys: keys, rateLimiter: rateLimiter, concurrency: concurrency, authCache: newAuthKeyCache(), touches: newTouchTracker(), cipher: cipher}
+	service := &Service{keys: keys, rateLimiter: rateLimiter, concurrency: concurrency, authCache: newAuthKeyCache(), touches: newTouchTracker(), cipher: cipher, activeBilling: make(map[string]struct{})}
 	service.UpdateDefaults(defaultRPM, defaultMax)
 	return service
 }
@@ -87,6 +99,19 @@ func NewService(keys repository.ClientKeyRepository, rateLimiter repository.Rate
 func (s *Service) UpdateDefaults(defaultRPM, defaultMax int) {
 	s.defaultRPM.Store(int64(defaultRPM))
 	s.defaultMax.Store(int64(defaultMax))
+}
+
+// ApplyInvalidation removes cached authorization policy after a local or remote
+// client-key mutation. A zero ID represents a batch-wide invalidation.
+func (s *Service) ApplyInvalidation(event repository.InvalidationEvent) {
+	if event.Kind != repository.InvalidationClientKeyChanged {
+		return
+	}
+	if event.ClientKeyID == 0 {
+		s.authCache.clear()
+		return
+	}
+	s.authCache.deleteID(event.ClientKeyID)
 }
 
 func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]clientkeydomain.Key, int64, error) {
@@ -123,6 +148,11 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Created, error
 	if input.BillingLimitUSDTicks < 0 || input.BillingLimitUSDTicks > clientkeydomain.MaxBillingLimitTicks {
 		return Created{}, invalidInput("billingLimitUsdTicks 超出允许范围")
 	}
+	providerScope, providerScopeValid := clientkeydomain.NormalizeProviderScope(input.ProviderScope)
+	tierScope, tierScopeValid := clientkeydomain.NormalizeTierScope(input.TierScope)
+	if !providerScopeValid || !tierScopeValid {
+		return Created{}, invalidInput("providerScope 或 tierScope 无效")
+	}
 	prefix, err := security.NewHexToken(6)
 	if err != nil {
 		return Created{}, err
@@ -139,16 +169,25 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Created, error
 	if err != nil {
 		return Created{}, fmt.Errorf("加密客户端 Key: %w", err)
 	}
-	if input.RPMLimit == 0 {
+	if input.RPMUnlimited {
+		input.RPMLimit = 0
+	} else if input.RPMLimit == 0 {
 		input.RPMLimit = int(s.defaultRPM.Load())
 	}
-	if input.MaxConcurrent == 0 {
+	if input.ConcurrencyUnlimited {
+		input.MaxConcurrent = 0
+	} else if input.MaxConcurrent == 0 {
 		input.MaxConcurrent = int(s.defaultMax.Load())
 	}
-	if input.RPMLimit < 1 || input.MaxConcurrent < 1 {
-		return Created{}, invalidInput("RPM 和最大并发必须大于零")
+	if input.RPMLimit < 0 || input.MaxConcurrent < 0 {
+		return Created{}, invalidInput("RPM 和最大并发不能小于零")
 	}
-	value, err := s.keys.Create(ctx, clientkeydomain.Key{Name: strings.TrimSpace(input.Name), Prefix: prefix, SecretHash: security.HashToken(raw), EncryptedSecret: encryptedSecret, Enabled: input.Enabled, ExpiresAt: input.ExpiresAt, RPMLimit: input.RPMLimit, MaxConcurrent: input.MaxConcurrent, BillingLimitUSDTicks: input.BillingLimitUSDTicks, AllowedModels: input.AllowedModels})
+	value, err := s.keys.Create(ctx, clientkeydomain.Key{
+		Name: strings.TrimSpace(input.Name), Prefix: prefix, SecretHash: security.HashToken(raw), EncryptedSecret: encryptedSecret,
+		Enabled: input.Enabled, ExpiresAt: input.ExpiresAt, RPMLimit: input.RPMLimit, MaxConcurrent: input.MaxConcurrent,
+		BillingLimitUSDTicks: input.BillingLimitUSDTicks, AllowModelAliases: input.AllowModelAliases, AllowedModels: input.AllowedModels,
+		ProviderScope: providerScope, TierScope: tierScope,
+	})
 	return Created{Key: value, Secret: raw}, mapRepositoryError(err)
 }
 
@@ -192,14 +231,14 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (cli
 		value.ExpiresAt = input.ExpiresAt
 	}
 	if input.RPMLimit != nil {
-		if *input.RPMLimit < 1 || *input.RPMLimit > clientkeydomain.MaxRPMLimit {
-			return clientkeydomain.Key{}, invalidInput("rpmLimit 必须在 1 到 100000 之间")
+		if *input.RPMLimit < 0 || *input.RPMLimit > clientkeydomain.MaxRPMLimit {
+			return clientkeydomain.Key{}, invalidInput("rpmLimit 必须在 0 到 100000 之间")
 		}
 		value.RPMLimit = *input.RPMLimit
 	}
 	if input.MaxConcurrent != nil {
-		if *input.MaxConcurrent < 1 || *input.MaxConcurrent > clientkeydomain.MaxConcurrent {
-			return clientkeydomain.Key{}, invalidInput("maxConcurrent 必须在 1 到 1024 之间")
+		if *input.MaxConcurrent < 0 || *input.MaxConcurrent > clientkeydomain.MaxConcurrent {
+			return clientkeydomain.Key{}, invalidInput("maxConcurrent 必须在 0 到 1024 之间")
 		}
 		value.MaxConcurrent = *input.MaxConcurrent
 	}
@@ -209,8 +248,25 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (cli
 		}
 		value.BillingLimitUSDTicks = *input.BillingLimitUSDTicks
 	}
+	if input.AllowModelAliases != nil {
+		value.AllowModelAliases = *input.AllowModelAliases
+	}
 	if input.AllowedModels != nil {
 		value.AllowedModels = *input.AllowedModels
+	}
+	if input.ProviderScope != nil {
+		providerScope, valid := clientkeydomain.NormalizeProviderScope(*input.ProviderScope)
+		if !valid {
+			return clientkeydomain.Key{}, invalidInput("providerScope 无效")
+		}
+		value.ProviderScope = providerScope
+	}
+	if input.TierScope != nil {
+		tierScope, valid := clientkeydomain.NormalizeTierScope(*input.TierScope)
+		if !valid {
+			return clientkeydomain.Key{}, invalidInput("tierScope 无效")
+		}
+		value.TierScope = tierScope
 	}
 	updated, err := s.keys.Update(ctx, value)
 	if err == nil {
@@ -288,19 +344,26 @@ func (s *Service) Authenticate(ctx context.Context, raw string) (clientkeydomain
 			return clientkeydomain.Key{}, nil, ErrBillingLimit
 		}
 	}
-	allowed, err := s.rateLimiter.Allow(ctx, fmt.Sprintf("client:%d", value.ID), value.RPMLimit, now)
-	if err != nil {
-		return clientkeydomain.Key{}, nil, fmt.Errorf("%w: RPM 限流器: %v", ErrRuntimeUnavailable, err)
+	if value.RPMLimit > 0 {
+		allowed, err := s.rateLimiter.Allow(ctx, fmt.Sprintf("client:%d", value.ID), value.RPMLimit, now)
+		if err != nil {
+			return clientkeydomain.Key{}, nil, fmt.Errorf("%w: RPM 限流器: %v", ErrRuntimeUnavailable, err)
+		}
+		if !allowed {
+			return clientkeydomain.Key{}, nil, ErrRateLimited
+		}
 	}
-	if !allowed {
-		return clientkeydomain.Key{}, nil, ErrRateLimited
-	}
-	release, acquired, err := s.concurrency.Acquire(ctx, fmt.Sprintf("client:%d", value.ID), value.MaxConcurrent)
-	if err != nil {
-		return clientkeydomain.Key{}, nil, fmt.Errorf("%w: 并发租约: %v", ErrRuntimeUnavailable, err)
-	}
-	if !acquired {
-		return clientkeydomain.Key{}, nil, ErrConcurrencyLimit
+	release := func() {}
+	if value.MaxConcurrent > 0 {
+		var acquired bool
+		var err error
+		release, acquired, err = s.concurrency.Acquire(ctx, fmt.Sprintf("client:%d", value.ID), value.MaxConcurrent)
+		if err != nil {
+			return clientkeydomain.Key{}, nil, fmt.Errorf("%w: 并发租约: %v", ErrRuntimeUnavailable, err)
+		}
+		if !acquired {
+			return clientkeydomain.Key{}, nil, ErrConcurrencyLimit
+		}
 	}
 	if s.touches.shouldTouch(value.ID, now) {
 		_ = s.keys.Touch(ctx, value.ID)
@@ -310,15 +373,7 @@ func (s *Service) Authenticate(ctx context.Context, raw string) (clientkeydomain
 
 // CanUseModel 判断空权限列表代表全部模型，否则要求显式授权。
 func (s *Service) CanUseModel(value clientkeydomain.Key, modelID uint64) bool {
-	if len(value.AllowedModels) == 0 {
-		return true
-	}
-	for _, allowed := range value.AllowedModels {
-		if allowed == modelID {
-			return true
-		}
-	}
-	return false
+	return value.AllowsModel(modelID)
 }
 
 // ReserveBilling 为有限额 Key 原子预留本次请求的预计费用。
@@ -335,11 +390,19 @@ func (s *Service) ReserveBilling(ctx context.Context, key clientkeydomain.Key, e
 	}
 	reserved, err := repo.ReserveBillingUsage(ctx, key.ID, eventID, amount, time.Now().UTC().Add(ttl))
 	if errors.Is(err, repository.ErrLimitExceeded) {
+		perfmetrics.Default.Inc("billing_reservation_total", perfmetrics.Labels{Subsystem: "billing", Operation: "reserve", Outcome: "limit_exceeded"})
 		return false, ErrBillingLimit
 	}
 	if err != nil {
+		perfmetrics.Default.Inc("billing_reservation_total", perfmetrics.Labels{Subsystem: "billing", Operation: "reserve", Outcome: "failed"})
 		return false, fmt.Errorf("%w: 计费预留: %v", ErrRuntimeUnavailable, err)
 	}
+	if reserved {
+		s.activeMu.Lock()
+		s.activeBilling[eventID] = struct{}{}
+		s.activeMu.Unlock()
+	}
+	perfmetrics.Default.Inc("billing_reservation_total", perfmetrics.Labels{Subsystem: "billing", Operation: "reserve", Outcome: "success"})
 	return reserved, nil
 }
 
@@ -350,9 +413,38 @@ func (s *Service) CancelBilling(ctx context.Context, eventID string) error {
 		return nil
 	}
 	if err := repo.CancelBillingReservation(ctx, eventID); err != nil {
+		perfmetrics.Default.Inc("billing_reservation_total", perfmetrics.Labels{Subsystem: "billing", Operation: "cancel", Outcome: "failed"})
 		return fmt.Errorf("%w: 取消计费预留: %v", ErrRuntimeUnavailable, err)
 	}
+	s.CompleteBilling(eventID)
+	perfmetrics.Default.Inc("billing_reservation_total", perfmetrics.Labels{Subsystem: "billing", Operation: "cancel", Outcome: "success"})
 	return nil
+}
+
+// CompleteBilling removes the process-local active marker after the audit and
+// billing transaction commits or the reservation is explicitly cancelled.
+func (s *Service) CompleteBilling(eventID string) {
+	if eventID == "" {
+		return
+	}
+	s.CompleteBillingBatch([]string{eventID})
+}
+
+func (s *Service) CompleteBillingBatch(eventIDs []string) {
+	s.ReleaseBillingProtectionBatch(eventIDs)
+}
+
+// ReleaseBillingProtectionBatch removes process-local activity markers. The
+// durable reservation remains authoritative until commit, cancel, or expiry.
+func (s *Service) ReleaseBillingProtectionBatch(eventIDs []string) {
+	if len(eventIDs) == 0 {
+		return
+	}
+	s.activeMu.Lock()
+	for _, eventID := range eventIDs {
+		delete(s.activeBilling, eventID)
+	}
+	s.activeMu.Unlock()
 }
 
 // CleanupExpiredBilling 释放进程异常遗留的过期预留。
@@ -361,28 +453,31 @@ func (s *Service) CleanupExpiredBilling(ctx context.Context, limit int) (int, er
 	if !ok {
 		return 0, fmt.Errorf("%w: 客户端 Key 仓储不支持计费预留", ErrRuntimeUnavailable)
 	}
-	return repo.CleanupExpiredBillingReservations(ctx, time.Now().UTC(), limit)
+	s.activeMu.RLock()
+	protected := make([]string, 0, len(s.activeBilling))
+	for eventID := range s.activeBilling {
+		protected = append(protected, eventID)
+	}
+	s.activeMu.RUnlock()
+	cleaned, err := repo.CleanupExpiredBillingReservations(ctx, time.Now().UTC(), limit, protected)
+	outcome := "success"
+	if err != nil {
+		outcome = "failed"
+	}
+	perfmetrics.Default.Add("billing_reservation_cleanup_rows", perfmetrics.Labels{Subsystem: "billing", Operation: "cleanup", Outcome: outcome}, int64(cleaned))
+	return cleaned, err
 }
 
 func normalizePage(page, pageSize int) (int, int) {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 {
-		pageSize = 20
-	}
-	if pageSize > 100 {
-		pageSize = 100
-	}
-	return page, pageSize
+	return repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
 }
 
 func normalizeBatchIDs(ids []uint64) ([]uint64, error) {
 	if len(ids) == 0 {
 		return nil, invalidInput("至少选择一个 Key")
 	}
-	if len(ids) > 500 {
-		return nil, invalidInput("单次最多处理 500 个 Key")
+	if len(ids) > repository.MaxPageSize {
+		return nil, invalidInput(fmt.Sprintf("单次最多处理 %d 个 Key", repository.MaxPageSize))
 	}
 	seen := make(map[uint64]struct{}, len(ids))
 	result := make([]uint64, 0, len(ids))
