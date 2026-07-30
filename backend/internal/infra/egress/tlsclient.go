@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -19,6 +20,9 @@ func (l *Lease) DialWebSocket(ctx context.Context, endpoint string, headers fhtt
 	if l == nil || l.browser == nil {
 		return nil, nil, errors.New("当前出口客户端不支持浏览器 WebSocket")
 	}
+	if handshakeTimeout <= 0 || handshakeTimeout > 5*time.Second {
+		handshakeTimeout = 5 * time.Second
+	}
 	for attempt := 0; ; attempt++ {
 		dialer := &websocket.Dialer{
 			HandshakeTimeout:  handshakeTimeout,
@@ -26,14 +30,31 @@ func (l *Lease) DialWebSocket(ctx context.Context, endpoint string, headers fhtt
 			NetDialContext:    l.browser.inner.GetDialer().DialContext,
 		}
 		connection, response, err := dialer.DialContext(ctx, endpoint, headers)
-		if err == nil || !l.sticky || attempt >= stickyProxyRetryLimit || !safeProxyConnectionFailure(err, fhttpResponseAsHTTP(response)) {
+		proxyResponseFailure := retryableResinResponse(fhttpResponseAsHTTP(response))
+		if err == nil && !proxyResponseFailure {
 			return connection, response, err
+		}
+		if strings.TrimSpace(l.ProxyURL) == "" || attempt >= stickyProxyRetryLimit || (!safeProxyConnectionFailure(err, fhttpResponseAsHTTP(response)) && !proxyResponseFailure) || l.reconnect == nil {
+			return connection, response, err
+		}
+		failedNodeID := l.NodeID
+		l.browser.CloseIdleConnections()
+		nextLease, reconnectErr := l.reconnect(ctx, failedNodeID)
+		if reconnectErr != nil {
+			return connection, response, firstError(err, reconnectErr)
 		}
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
-		l.browser.CloseIdleConnections()
+		l.adopt(nextLease)
 	}
+}
+
+func firstError(primary, fallback error) error {
+	if primary != nil {
+		return primary
+	}
+	return fallback
 }
 
 func fhttpResponseAsHTTP(response *fhttp.Response) *http.Response {

@@ -17,7 +17,7 @@ import (
 // the official CLI-facing transport. Browser TLS impersonation is reserved for
 // Grok Web, where the browser fingerprint and User-Agent belong together.
 func newBuildClient(proxyURL string) (*http.Client, error) {
-	direct := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	direct := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           direct.DialContext,
@@ -26,7 +26,7 @@ func newBuildClient(proxyURL string) (*http.Client, error) {
 		MaxIdleConnsPerHost:   128,
 		MaxConnsPerHost:       256,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}

@@ -40,6 +40,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	httpserver "github.com/chenyme/grok2api/backend/internal/transport/http"
 	httpmiddleware "github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
+	"golang.org/x/sync/singleflight"
 )
 
 // Application 管理后端进程生命周期和本地后台任务。
@@ -281,8 +282,42 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	updateService := updatecheckapp.NewService(buildinfo.CurrentVersion(), nil)
 
 	startup := newStartupState(len(windows))
+	var readinessMu sync.Mutex
+	var readinessCached httpserver.ReadinessSnapshot
+	var readinessExpiresAt time.Time
+	var readinessLoads singleflight.Group
 	readiness := func(readyCtx context.Context) httpserver.ReadinessSnapshot {
-		return readinessSnapshot(readyCtx, startup, runtimeHealth, modelRepo, accountRepo, providers)
+		// 启动阶段只读取轻量状态，确保 reconciliation 的变化立即可见。
+		if !startup.acceptsTraffic() {
+			return readinessSnapshot(readyCtx, startup, runtimeHealth, modelRepo, accountRepo, providers)
+		}
+		now := time.Now()
+		readinessMu.Lock()
+		if now.Before(readinessExpiresAt) {
+			cached := readinessCached
+			readinessMu.Unlock()
+			return cached
+		}
+		readinessMu.Unlock()
+		loaded, _, _ := readinessLoads.Do("readiness", func() (any, error) {
+			readinessMu.Lock()
+			if time.Now().Before(readinessExpiresAt) {
+				cached := readinessCached
+				readinessMu.Unlock()
+				return cached, nil
+			}
+			readinessMu.Unlock()
+			// 与探针请求的短超时解耦，确保第一次昂贵计算能完成并服务后续探针。
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			snapshot := readinessSnapshot(refreshCtx, startup, runtimeHealth, modelRepo, accountRepo, providers)
+			readinessMu.Lock()
+			readinessCached = snapshot
+			readinessExpiresAt = time.Now().Add(5 * time.Minute)
+			readinessMu.Unlock()
+			return snapshot, nil
+		})
+		return loaded.(httpserver.ReadinessSnapshot)
 	}
 	router := httpserver.New(httpserver.Dependencies{Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes, ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies, SwaggerEnabled: cfg.Server.SwaggerEnabled, PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath, Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService, AccountSync: accountSyncService, Models: modelService, ClientKeys: clientKeyService, Audits: auditService, Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService, Egress: egressService, Updates: updateService})
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: cfg.Server.ReadTimeout.Value(), IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}

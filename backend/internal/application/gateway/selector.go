@@ -25,7 +25,9 @@ type accountLease struct {
 
 const quotaProbeLease = 5 * time.Minute
 const successPersistInterval = 30 * time.Second
-const candidateCacheTTL = time.Second
+// candidateCacheTTL 只作为数据库状态的兜底刷新周期。账号健康和额度变化会在
+// 写库后同步更新或失效内存快照，没必要在大号池下每秒重建数万条候选记录。
+const candidateCacheTTL = 5 * time.Minute
 
 type candidateSnapshot struct {
 	values    []account.RoutingCandidate
@@ -137,15 +139,15 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 	if err != nil {
 		return nil, err
 	}
-	normalCandidates := make([]account.RoutingCandidate, 0, len(values))
-	probeCandidates := make([]account.RoutingCandidate, 0, len(values))
+	normalCandidates := make([]int, 0, len(values))
+	probeCandidates := make([]int, 0)
 	supportedCandidates := 0
 	consideredCandidates := 0
 	coolingCandidates := 0
 	modelCoolingCandidates := 0
 	quotaCandidates := 0
 	var earliestRetry time.Time
-	for _, candidate := range values {
+	for index, candidate := range values {
 		value := candidate.Credential
 		if excluded[value.ID] || value.AuthStatus != account.AuthStatusActive {
 			continue
@@ -168,7 +170,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 		quotaRecovery := candidate.QuotaRecovery
 		if quotaRecovery != nil && quotaRecovery.Status != account.QuotaRecoveryStatusActive {
 			if allowQuotaProbe && quotaRecovery.NextProbeAt != nil && !now.Before(*quotaRecovery.NextProbeAt) {
-				probeCandidates = append(probeCandidates, candidate)
+				probeCandidates = append(probeCandidates, index)
 			} else {
 				quotaCandidates++
 				if quotaRecovery.NextProbeAt != nil {
@@ -188,7 +190,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			}
 			continue
 		}
-		normalCandidates = append(normalCandidates, candidate)
+		normalCandidates = append(normalCandidates, index)
 	}
 	if len(normalCandidates) == 0 && len(probeCandidates) == 0 {
 		reason := SelectionNoAccounts
@@ -205,7 +207,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 		return nil, &SelectionUnavailableError{Reason: reason, RetryAfter: retryDelay(now, earliestRetry)}
 	}
 	if len(probeCandidates) > 0 {
-		plan, err := s.planCandidates(ctx, probeCandidates, now, s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, probeCandidates, now, s.resolveTierOrder(provider, upstreamModel))
 		if err != nil {
 			return nil, err
 		}
@@ -237,7 +239,8 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			return nil, fmt.Errorf("读取会话粘滞状态: %w", err)
 		}
 		if ok {
-			for _, candidate := range normalCandidates {
+			for _, index := range normalCandidates {
+				candidate := values[index]
 				if candidate.Credential.ID == stickyID {
 					lease, acquireErr := s.claimAccountSlot(ctx, candidate.Credential)
 					if acquireErr != nil {
@@ -256,7 +259,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 	waitDeadline := time.Now().Add(capacityWait)
 	for {
 		currentTime := time.Now().UTC()
-		plan, err := s.planCandidates(ctx, normalCandidates, currentTime, s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, currentTime, s.resolveTierOrder(provider, upstreamModel))
 		if err != nil {
 			return nil, err
 		}
@@ -456,6 +459,37 @@ func (s *Selector) MarkPaidQuotaExhausted(ctx context.Context, credential accoun
 // MarkQuotaStateChanged 在 Billing 探测改变持久化额度状态后立即失效候选快照。
 func (s *Selector) MarkQuotaStateChanged(provider account.Provider) { s.invalidateCandidates(provider) }
 
+// RemoveAccount 在账号已被持久化为不可路由状态后，只从现有不可变快照中移除
+// 这一条账号并清理 sticky。避免为单账号 401/403 清空整个 Provider 缓存并重新扫库。
+func (s *Selector) RemoveAccount(ctx context.Context, provider account.Provider, accountID uint64) {
+	if accountID == 0 {
+		return
+	}
+	_ = s.sticky.DeleteByAccount(ctx, accountID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, snapshot := range s.candidates {
+		if key.provider != provider {
+			continue
+		}
+		index := -1
+		for candidateIndex := range snapshot.values {
+			if snapshot.values[candidateIndex].Credential.ID == accountID {
+				index = candidateIndex
+				break
+			}
+		}
+		if index < 0 {
+			continue
+		}
+		values := make([]account.RoutingCandidate, 0, len(snapshot.values)-1)
+		values = append(values, snapshot.values[:index]...)
+		values = append(values, snapshot.values[index+1:]...)
+		snapshot.values = values
+		s.candidates[key] = snapshot
+	}
+}
+
 // ConsumeQuota 将成功请求的本地额度变化应用到候选快照，避免为单账号变化清空整个 Provider 缓存。
 func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mode string, amount int) {
 	if accountID == 0 || mode == "" || mode == "weekly" || amount <= 0 {
@@ -467,17 +501,24 @@ func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mod
 		if key.provider != provider {
 			continue
 		}
+		var cloned []account.RoutingCandidate
 		for index := range snapshot.values {
 			candidate := &snapshot.values[index]
 			if candidate.Credential.ID != accountID || candidate.QuotaWindow == nil || candidate.QuotaWindow.Mode != mode {
 				continue
 			}
+			cloned = append([]account.RoutingCandidate(nil), snapshot.values...)
+			candidate = &cloned[index]
 			window := *candidate.QuotaWindow
 			window.Remaining = max(0, window.Remaining-amount)
 			window.UpdatedAt = time.Now().UTC()
 			candidate.QuotaWindow = &window
+			break
 		}
-		s.candidates[key] = snapshot
+		if cloned != nil {
+			snapshot.values = cloned
+			s.candidates[key] = snapshot
+		}
 	}
 }
 
@@ -496,7 +537,7 @@ func (s *Selector) MarkFailure(ctx context.Context, credential account.Credentia
 	}
 	until := time.Now().UTC().Add(cooldown)
 	_ = s.accounts.UpdateHealth(ctx, credential.ID, failureCount, &until, fmt.Sprintf("upstream status %d", status), false)
-	s.invalidateCandidates(credential.Provider)
+	s.updateCandidateHealth(credential.Provider, credential.ID, failureCount, &until, fmt.Sprintf("upstream status %d", status))
 	if status == 401 || status == 402 || status == 403 || status == 429 {
 		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 	}
@@ -506,7 +547,7 @@ func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider
 	key := candidateCacheKey{provider: provider, upstreamModel: upstreamModel, quotaMode: quotaMode}
 	s.mu.Lock()
 	if snapshot, ok := s.candidates[key]; ok && now.Before(snapshot.expiresAt) {
-		values := append([]account.RoutingCandidate(nil), snapshot.values...)
+		values := snapshot.values
 		s.mu.Unlock()
 		return values, nil
 	}
@@ -516,7 +557,7 @@ func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider
 		checkTime := time.Now().UTC()
 		s.mu.Lock()
 		if snapshot, ok := s.candidates[key]; ok && checkTime.Before(snapshot.expiresAt) {
-			values := append([]account.RoutingCandidate(nil), snapshot.values...)
+			values := snapshot.values
 			s.mu.Unlock()
 			return values, nil
 		}
@@ -533,7 +574,31 @@ func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider
 	if err != nil {
 		return nil, err
 	}
-	return append([]account.RoutingCandidate(nil), loaded.([]account.RoutingCandidate)...), nil
+	return loaded.([]account.RoutingCandidate), nil
+}
+
+// updateCandidateHealth 以 copy-on-write 更新单账号健康状态，避免一次 429 清空整个
+// Provider 的候选缓存。已发布的快照不会原地修改，因此并发选号可以无锁读取。
+func (s *Selector) updateCandidateHealth(provider account.Provider, accountID uint64, failureCount int, cooldownUntil *time.Time, lastError string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, snapshot := range s.candidates {
+		if key.provider != provider {
+			continue
+		}
+		for index := range snapshot.values {
+			if snapshot.values[index].Credential.ID != accountID {
+				continue
+			}
+			values := append([]account.RoutingCandidate(nil), snapshot.values...)
+			values[index].Credential.FailureCount = failureCount
+			values[index].Credential.CooldownUntil = cooldownUntil
+			values[index].Credential.LastError = lastError
+			snapshot.values = values
+			s.candidates[key] = snapshot
+			break
+		}
+	}
 }
 
 func (s *Selector) invalidateCandidates(provider account.Provider) {

@@ -551,7 +551,7 @@ attemptLoop:
 			response.Body.Close()
 			if credential.AuthType == accountdomain.AuthTypeSSO {
 				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
-				s.selector.MarkFailure(ctx, credential, http.StatusUnauthorized, 0)
+				s.selector.RemoveAccount(ctx, credential.Provider, credential.ID)
 				lease.Release()
 				lastErr = fmt.Errorf("%s SSO 凭据已失效", credential.Provider)
 				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, nil, credential.ID, credential.Name)
@@ -588,7 +588,7 @@ attemptLoop:
 			if response.StatusCode == http.StatusUnauthorized {
 				body, _ := readRetryableBody(response.Body)
 				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, "Grok Build OAuth credential rejected after refresh")
-				s.selector.MarkQuotaStateChanged(credential.Provider)
+				s.selector.RemoveAccount(ctx, credential.Provider, credential.ID)
 				lease.Release()
 				lastErr = fmt.Errorf("刷新后上游仍返回 401")
 				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, body, credential.ID, credential.Name)
@@ -619,7 +619,7 @@ attemptLoop:
 				s.logger.Warn("upstream_team_model_rate_limited", "request_id", input.RequestID, "provider", credential.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "scope", response.RateLimit.Scope, "actual", response.RateLimit.Actual, "limit", response.RateLimit.Limit, "retry_after", lastFailure.RetryAfter)
 				continue
 			}
-			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
+			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && lastFailure.CredentialRejected && !lastFailure.PermanentAccountDenial {
 				authRecoveryAttempted[credential.ID] = true
 				refreshed, refreshErr := ensureCredential(credential, true)
 				if refreshErr != nil {
@@ -661,11 +661,11 @@ attemptLoop:
 			}
 			if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
 				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
-				s.selector.MarkQuotaStateChanged(credential.Provider)
+				s.selector.RemoveAccount(ctx, credential.Provider, credential.ID)
 				failureHandled = true
 			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
 				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s credential rejected", credential.Provider))
-				s.selector.MarkQuotaStateChanged(credential.Provider)
+				s.selector.RemoveAccount(ctx, credential.Provider, credential.ID)
 				failureHandled = true
 			}
 			if lastFailure.AccountScoped && !failureHandled {
@@ -973,7 +973,7 @@ func (s *Service) markPermanentlyUnrefreshableCredentialRejected(ctx context.Con
 
 func (s *Service) markCredentialRejectedAfterPermanentRefresh(ctx context.Context, credential accountdomain.Credential) {
 	_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", credential.Provider))
-	s.selector.MarkQuotaStateChanged(credential.Provider)
+	s.selector.RemoveAccount(ctx, credential.Provider, credential.ID)
 }
 
 func readRetryableBody(body io.ReadCloser) ([]byte, error) {
@@ -1023,7 +1023,12 @@ func isRetryableResponse(response *provider.Response) bool {
 	if response == nil || !isRetryable(response.StatusCode) {
 		return false
 	}
-	return !strings.EqualFold(strings.TrimSpace(response.Header.Get("X-Should-Retry")), "false")
+	if !strings.EqualFold(strings.TrimSpace(response.Header.Get("X-Should-Retry")), "false") {
+		return true
+	}
+	// X-Should-Retry:false 只禁止普通服务错误重放，不能跳过账号状态类响应的
+	// 分类与摘除；否则 permission-denied 账号会保持 active 并被 sticky 反复命中。
+	return response.StatusCode == http.StatusPaymentRequired || response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {

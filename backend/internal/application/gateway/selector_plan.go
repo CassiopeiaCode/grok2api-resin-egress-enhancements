@@ -87,9 +87,19 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 
 // planCandidates 批量读取动态并发状态，并以 O(n) 建堆生成保持原比较规则的候选计划。
 func (s *Selector) planCandidates(ctx context.Context, values []account.RoutingCandidate, now time.Time, tierOrder []account.WebTier) (*candidatePlan, error) {
-	keys := make([]string, len(values))
-	for index, candidate := range values {
-		keys[index] = accountConcurrencyKey(candidate.Credential.ID)
+	indexes := make([]int, len(values))
+	for index := range values {
+		indexes[index] = index
+	}
+	return s.planCandidateIndexes(ctx, values, indexes, now, tierOrder)
+}
+
+// planCandidateIndexes 让热路径只携带轻量下标，避免每次请求复制数万份
+// RoutingCandidate（其中包含多个字符串、时间和指针字段）。
+func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier) (*candidatePlan, error) {
+	keys := make([]string, len(indexes))
+	for position, index := range indexes {
+		keys[position] = accountConcurrencyKey(values[index].Credential.ID)
 	}
 	var concurrencySnapshot map[string]int
 	batchReader, batched := s.concurrency.(repository.ConcurrencySnapshotReader)
@@ -100,8 +110,8 @@ func (s *Selector) planCandidates(ctx context.Context, values []account.RoutingC
 			return nil, fmt.Errorf("批量读取账号并发租约: %w", err)
 		}
 	}
-	inFlight := make([]int, len(values))
-	for index := range values {
+	inFlight := make([]int, len(indexes))
+	for index := range indexes {
 		if batched {
 			inFlight[index] = concurrencySnapshot[keys[index]]
 			continue
@@ -114,17 +124,18 @@ func (s *Selector) planCandidates(ctx context.Context, values []account.RoutingC
 	}
 
 	s.mu.Lock()
-	scores := make([]candidateScore, len(values))
-	for index, candidate := range values {
+	scores := make([]candidateScore, len(indexes))
+	for position, index := range indexes {
+		candidate := values[index]
 		score := candidateScore{
 			index: index, tier: tierOrderRank(tierOrder, candidate.Credential.WebTier),
-			inFlight: inFlight[index], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
+			inFlight: inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
 		}
 		if candidate.Billing != nil {
 			score.remaining = candidate.Billing.Remaining()
 			score.billingFresh = now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute
 		}
-		scores[index] = score
+		scores[position] = score
 	}
 	s.mu.Unlock()
 

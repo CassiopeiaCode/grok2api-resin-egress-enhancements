@@ -50,7 +50,7 @@ func newPinnedHTTPSClient(proxyURL, serverName string, tlsConfig *tls.Config) (*
 	if serverName == "" {
 		return nil, errors.New("TLS ServerName 不能为空")
 	}
-	direct := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	direct := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 	if tlsConfig == nil {
 		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	} else {
@@ -63,7 +63,7 @@ func newPinnedHTTPSClient(proxyURL, serverName string, tlsConfig *tls.Config) (*
 		ForceAttemptHTTP2:     true,
 		DisableKeepAlives:     true,
 		TLSClientConfig:       tlsConfig,
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}

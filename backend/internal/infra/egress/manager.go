@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"sort"
 	"strconv"
@@ -25,6 +26,8 @@ const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 const nodeSnapshotTTL = time.Second
 const stickyProxyRetryLimit = 2
 
+var errProxyConnectionRetry = errors.New("代理连接失败，切换出口重试")
+
 type Lease struct {
 	NodeID    uint64
 	NodeName  string
@@ -36,6 +39,7 @@ type Lease struct {
 	browser   *browserClient
 	sticky    bool
 	release   func()
+	reconnect func(context.Context, uint64) (*Lease, error)
 }
 
 type requestClient interface {
@@ -125,9 +129,15 @@ func (m *Manager) AcquireIfConfigured(ctx context.Context, scope domain.Scope, a
 }
 
 func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, credentialCookies string) (*Lease, bool, error) {
+	return m.acquireExcluding(ctx, scope, affinity, allowDirect, credentialCookies, 0)
+}
+
+func (m *Manager) acquireExcluding(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, credentialCookies string, excludedNodeID uint64) (*Lease, bool, error) {
 	now := time.Now().UTC()
 	configured := false
 	var available []domain.Node
+	var cooledPreferred []domain.Node
+	var cooledFallback []domain.Node
 	for _, candidateScope := range fallbackScopes(scope) {
 		nodes, err := m.listNodes(ctx, candidateScope, now)
 		if err != nil {
@@ -136,13 +146,33 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 		configured = configured || len(nodes) > 0
 		candidateAvailable := make([]domain.Node, 0, len(nodes))
 		for _, node := range nodes {
-			if node.Enabled && (node.CooldownUntil == nil || !now.Before(*node.CooldownUntil)) {
+			if !node.Enabled {
+				continue
+			}
+			if node.CooldownUntil != nil && now.Before(*node.CooldownUntil) {
+				cooledFallback = append(cooledFallback, node)
+				if excludedNodeID == 0 || node.ID != excludedNodeID {
+					cooledPreferred = append(cooledPreferred, node)
+				}
+				continue
+			}
+			if excludedNodeID == 0 || node.ID != excludedNodeID {
 				candidateAvailable = append(candidateAvailable, node)
 			}
 		}
 		if len(candidateAvailable) > 0 {
 			available = candidateAvailable
 			break
+		}
+	}
+	if len(available) == 0 {
+		cooled := cooledPreferred
+		if len(cooled) == 0 {
+			cooled = cooledFallback
+		}
+		if len(cooled) > 0 {
+			// 所有节点都在临时冷却时随机救回一个，避免连接故障把整个代理池饿死。
+			available = []domain.Node{cooled[rand.IntN(len(cooled))]}
 		}
 	}
 	if len(available) == 0 {
@@ -203,7 +233,7 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	m.mu.Unlock()
 	recordSelection(ctx, Selection{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, Proxied: proxyURL != ""})
 	var once sync.Once
-	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, release: func() {
+	lease := &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, release: func() {
 		once.Do(func() {
 			m.mu.Lock()
 			m.inflight[selected.ID]--
@@ -212,7 +242,13 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 			}
 			m.mu.Unlock()
 		})
-	}}, true, nil
+	}}
+	lease.reconnect = func(reconnectCtx context.Context, failedNodeID uint64) (*Lease, error) {
+		m.FeedbackForScope(context.WithoutCancel(reconnectCtx), scope, failedNodeID, 0, errProxyConnectionRetry)
+		next, _, reconnectErr := m.acquireExcluding(reconnectCtx, scope, affinity, allowDirect, credentialCookies, failedNodeID)
+		return next, reconnectErr
+	}
+	return lease, true, nil
 }
 
 func renderAccountProxyURL(template, accountKey string) (string, error) {
