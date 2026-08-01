@@ -48,7 +48,14 @@ func WithCredential(ctx context.Context, credential accountdomain.Credential) co
 		if provider == "" {
 			provider = accountdomain.ProviderBuild
 		}
-		return WithEgressNode(WithAccount(ctx, string(provider), credential.ID), credential.EgressNodeID)
+		identity = string(provider) + "_" + fmt.Sprintf("%d", credential.ID)
+	}
+	// Resin uses the complete account identity as its sticky-lease key. The
+	// suffix is persisted per account and changes only after a confirmed fast
+	// successful stream; request failures never reach this path as a rotation
+	// signal. An underscore keeps the identity safe for existing normalisation.
+	if suffix := strings.TrimSpace(credential.ResinAccountSuffix); suffix != "" {
+		identity += "_" + suffix
 	}
 	return WithEgressNode(WithAccountIdentity(ctx, identity), credential.EgressNodeID)
 }

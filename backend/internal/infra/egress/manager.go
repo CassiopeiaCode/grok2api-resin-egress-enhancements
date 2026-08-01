@@ -302,6 +302,13 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 		}
 		identity = "sso_" + security.HashToken(token)[:32]
 	}
+	// Resin's account placeholder is shared by Build, Web, and Console for a
+	// linked login. Append the persisted suffix here as well as in the Build
+	// RoundTripper path, so a rotation observed by any channel changes the
+	// sticky proxy identity for all three channels.
+	if suffix := strings.TrimSpace(credential.ResinAccountSuffix); suffix != "" {
+		identity += "_" + suffix
+	}
 	ctx = WithAccountIdentity(ctx, identity)
 	ctx = WithEgressNode(ctx, credential.EgressNodeID)
 	lease, _, err := m.acquire(ctx, scope, strconv.FormatUint(credential.ID, 10), true, credential.EncryptedCloudflareCookie, credential.EgressNodeID)

@@ -57,6 +57,7 @@ type accountModel struct {
 	EgressNodeID         *uint64 `gorm:"index:idx_accounts_egress_node"`
 	EgressAssignmentMode string  `gorm:"size:16;not null;default:'';check:chk_accounts_egress_assignment_mode,egress_assignment_mode IN ('','manual','auto')"`
 	EgressAssignedAt     *time.Time
+	ResinAccountSuffix string `gorm:"size:64;not null;default:'';check:chk_accounts_resin_account_suffix,length(resin_account_suffix) <= 64"`
 	CreatedAt            time.Time               `gorm:"not null"`
 	UpdatedAt            time.Time               `gorm:"not null"`
 	Credential           *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`

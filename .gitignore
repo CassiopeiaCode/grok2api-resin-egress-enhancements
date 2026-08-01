@@ -30,12 +30,14 @@ Thumbs.db
 /.gocache/
 /.gocache-*/
 /backend/grok2api
+/backend/grok2api-prebuilt
 /backend/coverage.out
 *.coverprofile
 *.test
 
 # Frontend
 /.pnpm-store/
+/frontend/.pnpm-store/
 /frontend/node_modules/
 /frontend/dist/
 /frontend/.cache/
@@ -45,3 +47,4 @@ Thumbs.db
 /release/
 /.tmp/
 /tmp/
+/Dockerfile.prebuilt

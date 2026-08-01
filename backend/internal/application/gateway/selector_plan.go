@@ -65,6 +65,18 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	if leftCandidate.ModelCapabilityKnown != rightCandidate.ModelCapabilityKnown {
 		return leftCandidate.ModelCapabilityKnown
 	}
+	if left.Provider == account.ProviderBuild && right.Provider == account.ProviderBuild {
+		// Build scheduling deliberately stays on the most recently used idle
+		// account. This keeps the active set small and avoids scattering traffic
+		// across a large pool of accounts that have not been measured recently.
+		if leftScore.inFlight != rightScore.inFlight {
+			return leftScore.inFlight < rightScore.inFlight
+		}
+		if !leftScore.lastSelected.Equal(rightScore.lastSelected) {
+			return leftScore.lastSelected.After(rightScore.lastSelected)
+		}
+		return left.ID < right.ID
+	}
 	if leftScore.preferFreeBuild != rightScore.preferFreeBuild {
 		return leftScore.preferFreeBuild
 	}

@@ -1168,6 +1168,21 @@ func TestLinkedProvidersSharePersistedResinIdentity(t *testing.T) {
 	}
 }
 
+func TestResinAccountSuffixChangesStickyIdentityWithoutLeaseAPI(t *testing.T) {
+	ctx := WithCredential(context.Background(), accountdomain.Credential{
+		ID: 33, Provider: accountdomain.ProviderBuild, EgressIdentity: "sso_persisted_identity", ResinAccountSuffix: "847291",
+	})
+	if got := AccountFromContext(ctx); got != "sso_persisted_identity_847291" {
+		t.Fatalf("account identity = %q", got)
+	}
+	rotated := WithCredential(context.Background(), accountdomain.Credential{
+		ID: 33, Provider: accountdomain.ProviderBuild, EgressIdentity: "sso_persisted_identity", ResinAccountSuffix: "193804",
+	})
+	if got := AccountFromContext(rotated); got != "sso_persisted_identity_193804" {
+		t.Fatalf("rotated account identity = %q", got)
+	}
+}
+
 func TestConsoleFallsBackToWebAndSharesSSOResinIdentity(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {

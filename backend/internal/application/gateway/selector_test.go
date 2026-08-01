@@ -796,6 +796,31 @@ func TestCandidatePlanPreservesSelectorOrdering(t *testing.T) {
 	}
 }
 
+func TestBuildCandidatePlanPrefersMostRecentlyUsedIdleAccount(t *testing.T) {
+	now := time.Now().UTC()
+	limiter := &batchConcurrencyLimiter{values: map[string]int{"account:3": 1}}
+	selector := &Selector{
+		concurrency:    limiter,
+		lastSelectedAt: map[uint64]time.Time{1: now.Add(-3 * time.Minute), 2: now.Add(-time.Minute), 3: now.Add(-10 * time.Second)},
+	}
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 1, Provider: account.ProviderBuild}},
+		{Credential: account.Credential{ID: 2, Provider: account.ProviderBuild}},
+		{Credential: account.Credential{ID: 3, Provider: account.ProviderBuild}},
+	}
+	plan, err := selector.planCandidates(context.Background(), values, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordered := make([]uint64, 0, len(values))
+	for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
+		ordered = append(ordered, candidate.Credential.ID)
+	}
+	if expected := []uint64{2, 1, 3}; !slices.Equal(ordered, expected) {
+		t.Fatalf("Build 候选顺序 = %v, want %v", ordered, expected)
+	}
+}
+
 func TestSelectorConsumesOnlyMatchingQuotaSnapshot(t *testing.T) {
 	key := candidateCacheKey{provider: account.ProviderWeb, upstreamModel: "chat", quotaMode: "fast"}
 	values := []account.RoutingCandidate{{

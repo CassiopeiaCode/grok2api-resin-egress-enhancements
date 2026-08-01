@@ -468,7 +468,7 @@ func (c Config) Validate() error {
 		return errors.New("provider.build 客户端标识不能为空")
 	}
 	if timeout := c.Provider.Build.ResponseHeaderTimeout.Value(); timeout < settingsdomain.MinBuildResponseHeaderTimeout || timeout > settingsdomain.MaxBuildResponseHeaderTimeout {
-		return errors.New("Grok Build 响应头超时必须在 30 秒到 30 分钟之间")
+		return errors.New("Grok Build 响应头超时必须在 10 秒到 30 分钟之间")
 	}
 	webURL, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Web.BaseURL))
 	if err != nil || webURL.Scheme != "https" || webURL.Host == "" || webURL.User != nil {

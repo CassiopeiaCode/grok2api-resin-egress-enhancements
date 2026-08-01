@@ -169,6 +169,9 @@ type Credential struct {
 	EgressNodeID         uint64
 	EgressAssignmentMode EgressAssignmentMode
 	EgressAssignedAt     *time.Time
+	// ResinAccountSuffix 是账号级的 Resin 粘性身份后缀，不是凭据。
+	// 轮换后下一次请求会以新的身份访问 Resin，从而获得新的租约。
+	ResinAccountSuffix string
 	// WebNSFWEnabledAt 记录 Grok Web 上游首次确认 NSFW 已成功开启的时间。
 	// 普通导入、额度同步和凭据更新不得清除。
 	WebNSFWEnabledAt *time.Time

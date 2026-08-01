@@ -52,6 +52,22 @@ const modelCatalogRefreshTimeout = 30 * time.Second
 const accountStateWriteTimeout = 3 * time.Second
 const unlimitedRoutingAttempts = -1
 
+// resinFastStreamThreshold is intentionally a single hard boundary. A
+// successful measured Build stream above this speed rotates only the
+// account's persisted Resin identity suffix. Header timeouts are handled
+// separately because they are an explicit transport signal for every
+// provider sharing the same Resin account identity.
+const resinFastStreamThreshold = 200.0
+const resinMinimumMeasuredDurationMS int64 = 1000
+
+// resinSlowResponseHeaderThreshold is the non-streaming counterpart to the
+// 60-second streaming silence deadline. A successful Build response whose
+// HTTP headers take at least this long is still returned to the caller, but
+// the account's Resin identity is rotated for subsequent requests. The
+// current request is never replayed, so a slow response cannot be duplicated
+// or charged twice.
+const resinSlowResponseHeaderThreshold = 60 * time.Second
+
 type routingAttemptPolicy struct {
 	limit     int
 	unlimited bool
@@ -109,13 +125,15 @@ type Usage struct {
 }
 
 type Result struct {
-	StatusCode          int
-	Status              string
-	Header              http.Header
-	Body                io.ReadCloser
-	MarkFirstToken      func()
-	RecordStreamFailure func(StreamFailureDiagnostic)
-	Finalize            func(usage Usage, responseID, errorCode string)
+	StatusCode            int
+	Status                string
+	Header                http.Header
+	Body                  io.ReadCloser
+	MarkFirstToken        func()
+	MarkSSEEvent          func()
+	StreamSilenceTimedOut func() bool
+	RecordStreamFailure   func(StreamFailureDiagnostic)
+	Finalize              func(usage Usage, responseID, errorCode string)
 }
 
 // StreamFailureDiagnostic safely projects a failure termination event returned in-stream after downstream 2xx headers.
@@ -257,6 +275,47 @@ func (s *Service) markReauthRequired(ctx context.Context, requestID string, cred
 	}
 	s.selector.MarkQuotaStateChanged(credential.Provider)
 	return true
+}
+
+// observeResinTokenSpeed attaches to ordinary gateway requests. It does not
+// issue a probe or replay the request: every incoming request is the sample.
+// Once a fast successful stream is observed, the next request for this account
+// receives a new Resin identity suffix. Repeated fast samples therefore keep
+// rotating naturally until a later real request measures below the threshold.
+func (s *Service) observeResinTokenSpeed(ctx context.Context, credential accountdomain.Credential, firstTokenMS *int64, durationMS, outputTokens int64) {
+	if credential.Provider != accountdomain.ProviderBuild || firstTokenMS == nil || outputTokens <= 0 || durationMS <= *firstTokenMS {
+		return
+	}
+	measuredMS := durationMS - *firstTokenMS
+	// Very short generations make outputTokens / elapsed time dominated by
+	// timer and flush granularity. Treat them as unmeasured rather than
+	// rotating a healthy Resin identity on a noisy sample.
+	if measuredMS < resinMinimumMeasuredDurationMS {
+		return
+	}
+	speed := float64(outputTokens) * 1000 / float64(measuredMS)
+	if speed <= resinFastStreamThreshold {
+		return
+	}
+	s.rotateResinForSignal(ctx, credential, "fast_stream")
+}
+
+func (s *Service) rotateResinForSignal(ctx context.Context, credential accountdomain.Credential, signal string) {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountStateWriteTimeout)
+	defer cancel()
+	if _, err := s.accounts.RotateResinAccountSuffix(writeCtx, credential.ID, credential.ResinAccountSuffix); err != nil {
+		if errors.Is(err, repository.ErrConflict) {
+			s.logger.Debug("resin_account_suffix_rotation_skipped_stale_request", "account_id", credential.ID, "provider", credential.Provider, "signal", signal)
+			return
+		}
+		s.logger.Warn("resin_account_suffix_rotation_failed", "account_id", credential.ID, "provider", credential.Provider, "signal", signal, "error", err)
+		return
+	}
+	// Routing candidates cache the full credential, including the suffix. Drop
+	// the Build snapshot so the next request observes the new identity across
+	// local and multi-instance invalidation paths.
+	s.selector.MarkQuotaStateChanged(credential.Provider)
+	s.logger.Info("resin_account_suffix_rotated", "account_id", credential.ID, "provider", credential.Provider, "signal", signal)
 }
 
 func teamModelRateLimitKey(providerValue accountdomain.Provider, teamFingerprint, upstreamModel string) string {
@@ -743,11 +802,14 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	var lastFailure *UpstreamFailure
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
 	responseStartedAt := startedAt
+	var streamSilence *streamSilenceTracker
+	var responseHeaderWait time.Duration
 	forwardResponse := func(lease *accountLease, credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
 		responseStartedAt = started
 		lease.markSelectorUpstreamStarted()
 		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
+		responseHeaderWait = time.Since(started)
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
 		return response, err
@@ -821,6 +883,9 @@ attemptLoop:
 		if err != nil {
 			lease.Release()
 			lastErr = err
+			if neterrorpkg.IsResponseHeaderTimeout(err) {
+				s.rotateResinForSignal(ctx, credential, "response_header_timeout")
+			}
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
 				break
@@ -877,6 +942,9 @@ attemptLoop:
 					lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
 					break
 				} else {
+					if neterrorpkg.IsResponseHeaderTimeout(err) {
+						s.rotateResinForSignal(ctx, credential, "response_header_timeout")
+					}
 					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
 					if !isRetryableTransportFailure(credential.Provider, err) {
 						break attemptLoop
@@ -996,6 +1064,9 @@ attemptLoop:
 				if err != nil {
 					lease.Release()
 					lastErr = err
+					if neterrorpkg.IsResponseHeaderTimeout(err) {
+						s.rotateResinForSignal(ctx, credential, "response_header_timeout")
+					}
 					if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
 						break attemptLoop
@@ -1080,6 +1151,11 @@ attemptLoop:
 		finalize := func(usage Usage, responseID, errorCode string) {
 			once.Do(func() {
 				successful := response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == ""
+				silenceTimedOut := false
+				if streamSilence != nil {
+					silenceTimedOut = streamSilence.TimedOut()
+					streamSilence.Close()
+				}
 				lease.completeSelectorObservation(successful)
 				budget := newFinalizationBudget(string(operation), string(route.Provider))
 				if isUpstreamStreamFailure(errorCode) {
@@ -1124,6 +1200,16 @@ attemptLoop:
 				}
 				record.DurationMS = time.Since(startedAt).Milliseconds()
 				record.ErrorCode = errorCode
+				// Only a successful, measured stream is a Resin rotation signal.
+				// External request failures remain ordinary audit/health events and
+				// never cause an IP refresh.
+				if silenceTimedOut {
+					s.rotateResinForSignal(ctx, credential, "silent_stream")
+				} else if successful && input.Streaming {
+					s.observeResinTokenSpeed(ctx, credential, record.FirstTokenMS, record.DurationMS, usage.OutputTokens)
+				} else if successful && !input.Streaming && credential.Provider == accountdomain.ProviderBuild && responseHeaderWait >= resinSlowResponseHeaderThreshold {
+					s.rotateResinForSignal(ctx, credential, "slow_response_headers")
+				}
 				attempts := failureAttempts.snapshot()
 				if response.StatusCode < 200 || response.StatusCode >= 300 || errorCode != "" || len(attempts) > 0 {
 					record.Attempts = attempts
@@ -1184,8 +1270,19 @@ attemptLoop:
 		if firstToken != nil {
 			markFirstToken = firstToken.mark
 		}
+		if input.Streaming && credential.Provider == accountdomain.ProviderBuild && response.Body != nil {
+			streamSilence = newStreamSilenceTracker(response.Body, resinStreamSilenceTimeout)
+		}
 		timingHandedOff = true
-		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, MarkFirstToken: markFirstToken, RecordStreamFailure: recordStreamFailure, Finalize: finalize}, nil
+		var markSSEEvent func()
+		if streamSilence != nil {
+			markSSEEvent = streamSilence.MarkEvent
+		}
+		var silenceTimedOut func() bool
+		if streamSilence != nil {
+			silenceTimedOut = streamSilence.TimedOut
+		}
+		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, MarkFirstToken: markFirstToken, MarkSSEEvent: markSSEEvent, StreamSilenceTimedOut: silenceTimedOut, RecordStreamFailure: recordStreamFailure, Finalize: finalize}, nil
 	}
 	if lastFailure != nil {
 		record := auditBase
@@ -1232,7 +1329,7 @@ attemptLoop:
 
 func isUpstreamStreamFailure(errorCode string) bool {
 	switch errorCode {
-	case "upstream_stream_incomplete", "upstream_stream_interrupted":
+	case "upstream_stream_incomplete", "upstream_stream_interrupted", "upstream_stream_silent":
 		return true
 	default:
 		return false

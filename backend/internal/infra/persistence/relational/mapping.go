@@ -87,6 +87,7 @@ func toAccountDomain(value accountModel) account.Credential {
 		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt, WebTier: webTier, WebTierSyncedAt: webTierSyncedAt,
 		WebNSFWEnabledAt: webNSFWEnabledAt, WebTermsAcceptedAt: webTermsAcceptedAt, WebTermsAcceptedVersion: webTermsAcceptedVersion, WebBirthDateSetAt: webBirthDateSetAt, EgressIdentity: egressIdentity,
 		EgressNodeID: valueEgressNodeID(value.EgressNodeID), EgressAssignmentMode: account.EgressAssignmentMode(value.EgressAssignmentMode), EgressAssignedAt: value.EgressAssignedAt,
+		ResinAccountSuffix: value.ResinAccountSuffix,
 		BuildAPIFallback: value.BuildAPIFallback, BuildRouteMode: buildRouteMode,
 		BuildSuperEntitled: value.BuildSuperEntitled && account.Provider(value.Provider) == account.ProviderBuild,
 		CreatedAt:          value.CreatedAt, UpdatedAt: value.UpdatedAt,
@@ -125,6 +126,7 @@ func fromAccountDomain(value account.Credential) accountModel {
 		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt,
 		BuildAPIFallback: buildAPIFallback, BuildRouteMode: string(buildRouteMode), BuildSuperEntitled: buildSuperEntitled,
 		EgressNodeID: egressNodeID(value.EgressNodeID), EgressAssignmentMode: string(value.EgressAssignmentMode), EgressAssignedAt: value.EgressAssignedAt,
+		ResinAccountSuffix: value.ResinAccountSuffix,
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 }

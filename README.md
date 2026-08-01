@@ -26,6 +26,9 @@
 > [!NOTE]
 > This project is for technical research and learning purposes only. Please comply with Grok's official terms of use and local laws when using it; otherwise, you will be solely responsible for all consequences!
 
+> [!IMPORTANT]
+> This fork adds Resin sticky egress, Grok Build stream-quality observation, automatic IP rotation, shared Build/Web/Console proxy identity, and response-header timeout rotation. See [Resin egress and Grok Build quality protection](./RESIN_EGRESS_QUALITY.md) for the implementation, thresholds, and safety boundaries.
+
 ## Sponsors
 > [Want to sponsor this project?](mailto:chenyme03@gmail.com)
 

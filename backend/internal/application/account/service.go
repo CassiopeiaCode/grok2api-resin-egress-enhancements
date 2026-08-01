@@ -2,6 +2,8 @@ package account
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -849,6 +851,21 @@ func (s *Service) Get(ctx context.Context, id uint64) (View, error) {
 		return View{}, err
 	}
 	return view, nil
+}
+
+// RotateResinAccountSuffix assigns a new random, non-sensitive sticky
+// identity suffix to one account. It is intentionally separate from OAuth
+// credential state and never contacts Resin's lease API.
+func (s *Service) RotateResinAccountSuffix(ctx context.Context, id uint64, expectedSuffix string) (accountdomain.Credential, error) {
+	suffixRepo, ok := s.accounts.(repository.ResinAccountSuffixRepository)
+	if !ok {
+		return accountdomain.Credential{}, ErrUnsupported
+	}
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return accountdomain.Credential{}, fmt.Errorf("生成 Resin 账号后缀: %w", err)
+	}
+	return suffixRepo.RotateResinAccountSuffix(ctx, id, expectedSuffix, hex.EncodeToString(raw[:]))
 }
 
 func (s *Service) credentialMetadata(value accountdomain.Credential) provider.CredentialMetadata {

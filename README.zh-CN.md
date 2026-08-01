@@ -26,6 +26,9 @@
 > [!NOTE]
 > 本项目仅供技术研究与学习交流。使用时请务必遵循 Grok 官方的使用条款及当地法律法规，否则一切后果自负！
 
+> [!IMPORTANT]
+> 本分支增加了 Resin 粘性出口、Grok Build 流式质量观测、自动换 IP、Build/Web/Console 共享代理身份以及响应头超时轮换。实现原理、阈值和安全边界见 [Resin 出口接入与 Grok Build 降智规避](./RESIN_EGRESS_QUALITY.md)。
+
 ## 赞助商
 
 > [希望赞助这个项目？](mailto:chenyme03@gmail.com)

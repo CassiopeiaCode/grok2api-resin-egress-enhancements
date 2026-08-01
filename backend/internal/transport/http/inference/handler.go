@@ -1001,10 +1001,24 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 	}
 	var err error
 	if stream {
-		metadata, copyErr := copyStream(c.Writer, result.Body, protocol, result.MarkFirstToken)
+		metadata, copyErr := copyStream(c.Writer, result.Body, protocol, result.MarkFirstToken, result.MarkSSEEvent)
 		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
 		if metadata.StreamFailure != nil && result.RecordStreamFailure != nil {
 			result.RecordStreamFailure(*metadata.StreamFailure)
+		}
+		// A 60-second Build stream silence can happen before the upstream sends
+		// its first SSE event. In that case no downstream bytes have been
+		// committed yet, so replace the otherwise-empty upstream 200 with a
+		// normal gateway error. This keeps the Resin rotation signal while
+		// preventing clients from seeing a successful response with no SSE.
+		if copyErr != nil && result.StreamSilenceTimedOut != nil && result.StreamSilenceTimedOut() && !c.Writer.Written() {
+			errorCode = "upstream_stream_silent"
+			if anthropic {
+				writeAnthropicError(c, http.StatusGatewayTimeout, "timeout_error", "上游流式响应在 60 秒内没有发送任何事件", "upstream_stream_silent")
+			} else {
+				writeOpenAIError(c, http.StatusGatewayTimeout, "upstream_stream_silent", "上游流式响应在 60 秒内没有发送任何事件")
+			}
+			return
 		}
 	} else {
 		metadata, copyErr := copyJSON(c.Writer, result.Body, protocol)
@@ -1034,8 +1048,12 @@ type responseMetadata struct {
 	StreamFailure            *gateway.StreamFailureDiagnostic
 }
 
-func copyStream(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol, onFirstToken func()) (responseMetadata, error) {
-	inspector := &responseInspector{protocol: protocol, onFirstToken: onFirstToken}
+func copyStream(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol, onFirstToken func(), onSSEEvent ...func()) (responseMetadata, error) {
+	var eventCallback func()
+	if len(onSSEEvent) > 0 {
+		eventCallback = onSSEEvent[0]
+	}
+	inspector := &responseInspector{protocol: protocol, onFirstToken: onFirstToken, onSSEEvent: eventCallback}
 	buffer := make([]byte, responseCopyBufferBytes)
 	transferred := 0
 	for {
@@ -1114,6 +1132,7 @@ type responseInspector struct {
 	pending         []byte
 	metadata        responseMetadata
 	onFirstToken    func()
+	onSSEEvent      func()
 	firstTokenSeen  bool
 	firstTokenReady bool
 	terminalSuccess bool
@@ -1134,6 +1153,9 @@ func (i *responseInspector) Inspect(chunk []byte) {
 		i.pending = i.pending[index+1:]
 		if bytes.HasPrefix(line, []byte("data:")) {
 			value := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+			if i.onSSEEvent != nil {
+				i.onSSEEvent()
+			}
 			i.observeFirstToken(value)
 			i.observeTerminal(value)
 			if !bytes.Equal(value, []byte("[DONE]")) {

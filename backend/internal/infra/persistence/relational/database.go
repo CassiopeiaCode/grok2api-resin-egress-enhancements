@@ -49,7 +49,12 @@ func OpenSQLite(ctx context.Context, path string) (*Database, error) {
 	if err != nil {
 		return nil, fmt.Errorf("打开 SQLite: %w", err)
 	}
-	return configureDatabase(ctx, db, "sqlite", 16, 16)
+	// SQLite has a single writer. The application performs background account
+	// synchronization and durable billing-ledger writes concurrently; allowing
+	// sixteen pooled writers makes SQLITE_BUSY surface as ledger 503s under
+	// production load. One shared connection serializes write transactions
+	// while WAL still permits readers, preserving ledger consistency.
+	return configureDatabase(ctx, db, "sqlite", 1, 1)
 }
 
 // OpenPostgres 打开 PostgreSQL 数据库并配置连接池。

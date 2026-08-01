@@ -19,6 +19,14 @@ import (
 
 type browserClient struct{ inner tlsclient.HttpClient }
 
+const browserResponseHeaderTimeout = 10 * time.Second
+
+type browserResponseHeaderTimeoutError struct{}
+
+func (browserResponseHeaderTimeoutError) Error() string   { return "http2: timeout awaiting response headers" }
+func (browserResponseHeaderTimeoutError) Timeout() bool   { return true }
+func (browserResponseHeaderTimeoutError) Temporary() bool { return true }
+
 var chromeMajorPattern = regexp.MustCompile(`(?i)Chrome/(\d+)`)
 
 func (l *Lease) DialWebSocket(ctx context.Context, endpoint string, headers fhttp.Header, handshakeTimeout time.Duration) (*websocket.Conn, *fhttp.Response, error) {
@@ -102,11 +110,36 @@ func (c *browserClient) Do(request *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	fresponse, err := c.inner.Do(frequest)
-	if err != nil {
-		return nil, err
+	// tls-client exposes a whole-request timeout, but Web and Console need a
+	// header-only deadline so a valid long-running stream is not cut off after
+	// ten seconds. Run the header acquisition asynchronously, then leave the
+	// returned body unconstrained once headers arrive.
+	type result struct {
+		response *fhttp.Response
+		err      error
 	}
-	return fromFHTTPResponse(fresponse), nil
+	done := make(chan result, 1)
+	go func() {
+		response, doErr := c.inner.Do(frequest)
+		done <- result{response: response, err: doErr}
+	}()
+	timer := time.NewTimer(browserResponseHeaderTimeout)
+	defer timer.Stop()
+	select {
+	case value := <-done:
+		if value.err != nil {
+			return nil, value.err
+		}
+		return fromFHTTPResponse(value.response), nil
+	case <-request.Context().Done():
+		return nil, request.Context().Err()
+	case <-timer.C:
+		// Closing idle connections also interrupts tls-client's pending
+		// connection in the common HTTP/2/HTTP/1.1 paths. The caller will
+		// release the lease and rotate the account suffix immediately.
+		c.inner.CloseIdleConnections()
+		return nil, browserResponseHeaderTimeoutError{}
+	}
 }
 
 func fromFHTTPResponse(fresponse *fhttp.Response) *http.Response {

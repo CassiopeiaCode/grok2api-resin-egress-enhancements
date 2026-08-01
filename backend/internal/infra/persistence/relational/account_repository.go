@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -929,6 +930,113 @@ func (r *AccountRepository) UpsertByIdentity(ctx context.Context, value account.
 	return stored, result.Created, err
 }
 
+// RotateResinAccountSuffix changes only the non-sensitive Resin identity
+// suffix for one account. The expected value is part of the atomic WHERE
+// clause, so a late request cannot overwrite a suffix already selected by a
+// newer request. No lease delete, inherit, or release API is invoked.
+func (r *AccountRepository) RotateResinAccountSuffix(ctx context.Context, id uint64, expectedSuffix, suffix string) (account.Credential, error) {
+	expectedSuffix = strings.TrimSpace(expectedSuffix)
+	suffix = strings.TrimSpace(suffix)
+	if id == 0 || suffix == "" || len(suffix) > 64 {
+		return account.Credential{}, fmt.Errorf("Resin 账号后缀无效")
+	}
+	var familyIDs []uint64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
+		var root accountModel
+		if err := tx.Select("id", "provider", "resin_account_suffix").First(&root, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return repository.ErrNotFound
+			}
+			return err
+		}
+		familyIDs = resinAccountFamilyIDs(tx, root)
+		if len(familyIDs) == 0 {
+			familyIDs = []uint64{id}
+		}
+		// Lock the complete linked family in deterministic order. Build, Web,
+		// and Console are projections of one login and must switch Resin
+		// identity together when any one of them reports a header timeout.
+		var locked []accountModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id IN ?", familyIDs).Order("id ASC").Find(&locked).Error; err != nil {
+			return err
+		}
+		if root.ResinAccountSuffix != expectedSuffix {
+			return repository.ErrConflict
+		}
+		result := tx.Model(&accountModel{}).Where("id IN ?", familyIDs).Update("resin_account_suffix", suffix)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != int64(len(familyIDs)) {
+			return repository.ErrConflict
+		}
+		return nil
+	})
+	if err != nil {
+		return account.Credential{}, mapError(err)
+	}
+	stored, err := r.Get(ctx, id)
+	if err != nil {
+		return account.Credential{}, err
+	}
+	for _, familyID := range familyIDs {
+		if familyID == id {
+			r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: stored.Provider, AccountID: id})
+			continue
+		}
+		linked, getErr := r.Get(ctx, familyID)
+		if getErr == nil {
+			r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: linked.Provider, AccountID: familyID})
+		}
+	}
+	return stored, nil
+}
+
+// resinAccountFamilyIDs returns the linked Web/Build/Console projections for
+// one upstream login. It deliberately follows persisted link tables only; no
+// email/name guessing is allowed for sticky proxy identity changes.
+func resinAccountFamilyIDs(tx *gorm.DB, root accountModel) []uint64 {
+	ids := []uint64{root.ID}
+	appendUnique := func(value uint64) {
+		if value == 0 {
+			return
+		}
+		for _, existing := range ids {
+			if existing == value {
+				return
+			}
+		}
+		ids = append(ids, value)
+	}
+	var webID, buildID, consoleID uint64
+	switch account.Provider(root.Provider) {
+	case account.ProviderWeb:
+		webID = root.ID
+		tx.Table("account_provider_links").Where("web_account_id = ?", webID).Pluck("build_account_id", &buildID)
+		tx.Table("web_console_account_links").Where("web_account_id = ?", webID).Pluck("console_account_id", &consoleID)
+	case account.ProviderBuild:
+		buildID = root.ID
+		tx.Table("account_provider_links").Where("build_account_id = ?", buildID).Pluck("web_account_id", &webID)
+		if webID != 0 {
+			tx.Table("web_console_account_links").Where("web_account_id = ?", webID).Pluck("console_account_id", &consoleID)
+		}
+	case account.ProviderConsole:
+		consoleID = root.ID
+		tx.Table("web_console_account_links").Where("console_account_id = ?", consoleID).Pluck("web_account_id", &webID)
+		if webID != 0 {
+			tx.Table("account_provider_links").Where("web_account_id = ?", webID).Pluck("build_account_id", &buildID)
+		}
+	}
+	appendUnique(webID)
+	appendUnique(buildID)
+	appendUnique(consoleID)
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
 func (r *AccountRepository) UpsertManyByIdentity(ctx context.Context, values []account.Credential) ([]repository.AccountUpsertResult, error) {
 	if len(values) == 0 {
 		return []repository.AccountUpsertResult{}, nil
@@ -1066,6 +1174,7 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 		row.EgressNodeID = existing.EgressNodeID
 		row.EgressAssignmentMode = existing.EgressAssignmentMode
 		row.EgressAssignedAt = existing.EgressAssignedAt
+		row.ResinAccountSuffix = existing.ResinAccountSuffix
 		// reauth_marked_at 与 Update 路径一致：保持 reauth 时永不被普通 upsert 改写。
 		applyReauthMarkedAtTransition(&row, *existing)
 		if err := tx.Save(&row).Error; err != nil {
@@ -1107,7 +1216,7 @@ func (r *AccountRepository) Update(ctx context.Context, value account.Credential
 	var storedProvider account.Provider
 	if err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing accountModel
-		if err := tx.Select("id", "identity_key", "created_at", "provider", "auth_status", "reauth_marked_at").First(&existing, value.ID).Error; err != nil {
+		if err := tx.Select("id", "identity_key", "created_at", "provider", "auth_status", "reauth_marked_at", "resin_account_suffix").First(&existing, value.ID).Error; err != nil {
 			return err
 		}
 		storedProvider = account.Provider(existing.Provider)
@@ -1117,6 +1226,7 @@ func (r *AccountRepository) Update(ctx context.Context, value account.Credential
 		// 身份同步补充的 user_id/email 不得让普通编辑重写持久化身份键。
 		row.IdentityKey = existing.IdentityKey
 		row.CreatedAt = existing.CreatedAt
+		row.ResinAccountSuffix = existing.ResinAccountSuffix
 		applyReauthMarkedAtTransition(&row, existing)
 		if err := tx.Save(&row).Error; err != nil {
 			return err

@@ -4,7 +4,7 @@ import "time"
 
 const (
 	DefaultBuildResponseHeaderTimeout = 5 * time.Minute
-	MinBuildResponseHeaderTimeout     = 30 * time.Second
+	MinBuildResponseHeaderTimeout     = 10 * time.Second
 	MaxBuildResponseHeaderTimeout     = 30 * time.Minute
 )
 
