@@ -972,6 +972,13 @@ func (h *Handler) WriteAdminResult(c *gin.Context, result *gateway.Result, strea
 	h.writeResult(c, result, stream, streamProtocolResponses)
 }
 
+// WriteAdminChatResult uses the Chat Completions SSE parser for admin quality
+// tests that intentionally exercise the same protocol as production Build
+// clients.
+func (h *Handler) WriteAdminChatResult(c *gin.Context, result *gateway.Result, stream bool) {
+	h.writeResult(c, result, stream, streamProtocolChat)
+}
+
 func (h *Handler) writeAnthropicResult(c *gin.Context, result *gateway.Result, stream bool) {
 	h.writeProtocolResult(c, result, stream, true, streamProtocolAnthropic)
 }

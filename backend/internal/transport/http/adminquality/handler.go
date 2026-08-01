@@ -2,12 +2,14 @@ package adminquality
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
+	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/inference"
@@ -20,6 +22,7 @@ import (
 type Handler struct {
 	gateway   *gateway.Service
 	inference *inference.Handler
+	clientKeys *clientkeyapp.Service
 }
 
 type requestEnvelope struct {
@@ -27,6 +30,7 @@ type requestEnvelope struct {
 	AccountID       uint64          `json:"account_id"`
 	EgressNodeID    uint64          `json:"egress_node_id"`
 	ProxyUsername   string          `json:"proxy_username"`
+	Operation       string          `json:"operation"`
 	Model           string          `json:"model"`
 	Stream          *bool           `json:"stream"`
 	Request         json.RawMessage `json:"request"`
@@ -38,8 +42,8 @@ type requestMeta struct {
 	Stream bool   `json:"stream"`
 }
 
-func NewHandler(g *gateway.Service, i *inference.Handler) *Handler {
-	return &Handler{gateway: g, inference: i}
+func NewHandler(g *gateway.Service, i *inference.Handler, keys *clientkeyapp.Service) *Handler {
+	return &Handler{gateway: g, inference: i, clientKeys: keys}
 }
 
 func (h *Handler) Register(router *gin.RouterGroup) {
@@ -93,18 +97,63 @@ func (h *Handler) request(c *gin.Context) {
 	if requestID == "" {
 		requestID = "admin-quality-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
-	// An unrestricted synthetic key is used only after AdminAuth. Billing is
-	// explicitly disabled by AdminQualityTest, while normal audit/finalization
-	// remains active for later inspection of token timing.
-	key := clientkeydomain.Key{ID: 0, Name: "admin-quality-test", Enabled: true, ProviderScope: clientkeydomain.ProviderScopeAll, TierScope: clientkeydomain.TierScopeAll}
-	result, err := h.gateway.CreateResponse(c.Request.Context(), gateway.Input{
+	key, err := h.ensureAuditKey(c)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "quality_test_audit_unavailable", "message": "无法准备质量测试审计身份"}})
+		return
+	}
+	input := gateway.Input{
 		RequestID: requestID, ClientKey: key, PublicModel: publicModel, Body: body,
 		Streaming: meta.Stream, AdminQualityTest: true, ForcedAccountID: envelope.AccountID,
 		ForcedEgressNodeID: envelope.EgressNodeID, ForcedProxyUsername: proxyUsername,
-	})
+	}
+	var result *gateway.Result
+	chatProtocol := true
+	if strings.EqualFold(strings.TrimSpace(envelope.Operation), "responses") {
+		chatProtocol = false
+		result, err = h.gateway.CreateResponse(c.Request.Context(), input)
+	} else {
+		// Chat is the default because it matches the production Build request
+		// shape used by the token-speed samples.
+		result, err = h.gateway.CreateChatCompletion(c.Request.Context(), input)
+	}
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "quality_test_failed", "message": err.Error()}})
 		return
 	}
-	h.inference.WriteAdminResult(c, result, meta.Stream)
+	if chatProtocol {
+		h.inference.WriteAdminChatResult(c, result, meta.Stream)
+	} else {
+		h.inference.WriteAdminResult(c, result, meta.Stream)
+	}
+}
+
+// ensureAuditKey returns a real persisted client-key row so request_audits'
+// positive foreign-key/check constraints remain intact. It is never exposed
+// to downstream clients and AdminQualityTest disables billing reservation.
+func (h *Handler) ensureAuditKey(c *gin.Context) (clientkeydomain.Key, error) {
+	if h.clientKeys == nil {
+		return clientkeydomain.Key{}, fmt.Errorf("client key service unavailable")
+	}
+	values, _, err := h.clientKeys.List(c.Request.Context(), 1, 20, "__admin_quality_test__", clientkeyapp.ListFilter{})
+	if err != nil {
+		return clientkeydomain.Key{}, err
+	}
+	for _, value := range values {
+		if value.Name == "__admin_quality_test__" {
+			value.Enabled = true
+			value.ProviderScope = clientkeydomain.ProviderScopeAll
+			value.TierScope = clientkeydomain.TierScopeAll
+			return value, nil
+		}
+	}
+	created, err := h.clientKeys.Create(c.Request.Context(), clientkeyapp.CreateInput{
+		Name: "__admin_quality_test__", Enabled: true, RPMUnlimited: true,
+		ConcurrencyUnlimited: true, BillingLimitUSDTicks: 0,
+		ProviderScope: clientkeydomain.ProviderScopeAll, TierScope: clientkeydomain.TierScopeAll,
+	})
+	if err != nil {
+		return clientkeydomain.Key{}, err
+	}
+	return created.Key, nil
 }

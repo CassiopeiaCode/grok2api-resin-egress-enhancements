@@ -160,7 +160,7 @@ func New(deps Dependencies) *gin.Engine {
 		}
 		return deps.PublicAPIBaseURL
 	}, deps.Updates).Register(adminProtected)
-	adminqualityhttp.NewHandler(deps.Gateway, inferenceHandler).Register(adminProtected)
+	adminqualityhttp.NewHandler(deps.Gateway, inferenceHandler, deps.ClientKeys).Register(adminProtected)
 
 	v1 := router.Group("/v1")
 	v1.Use(deps.ConcurrencyGate.Middleware())
