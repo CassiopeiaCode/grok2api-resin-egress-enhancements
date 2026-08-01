@@ -796,7 +796,7 @@ func TestCandidatePlanPreservesSelectorOrdering(t *testing.T) {
 	}
 }
 
-func TestBuildCandidatePlanPrefersMostRecentlyUsedIdleAccount(t *testing.T) {
+func TestBuildCandidatePlanPrefersLeastRecentlyUsedIdleAccount(t *testing.T) {
 	now := time.Now().UTC()
 	limiter := &batchConcurrencyLimiter{values: map[string]int{"account:3": 1}}
 	selector := &Selector{
@@ -816,7 +816,7 @@ func TestBuildCandidatePlanPrefersMostRecentlyUsedIdleAccount(t *testing.T) {
 	for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
 		ordered = append(ordered, candidate.Credential.ID)
 	}
-	if expected := []uint64{2, 1, 3}; !slices.Equal(ordered, expected) {
+	if expected := []uint64{1, 2, 3}; !slices.Equal(ordered, expected) {
 		t.Fatalf("Build 候选顺序 = %v, want %v", ordered, expected)
 	}
 }
