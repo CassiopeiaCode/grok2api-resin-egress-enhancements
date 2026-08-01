@@ -286,9 +286,9 @@ func (s *Service) markReauthRequired(ctx context.Context, requestID string, cred
 
 // observeResinTokenSpeed attaches to ordinary gateway requests. It does not
 // issue a probe or replay the request: every incoming request is the sample.
-// Once a fast successful stream is observed, the next request for this account
-// receives a new Resin identity suffix. Repeated fast samples therefore keep
-// rotating naturally until a later real request measures below the threshold.
+// A fast successful Build stream rotates the Resin identity. The measurement
+// is taken only after the first token, so pre-first-token silence is handled
+// separately and does not enter this signal.
 func (s *Service) observeResinTokenSpeed(ctx context.Context, credential accountdomain.Credential, firstTokenMS *int64, durationMS, outputTokens int64) {
 	if credential.Provider != accountdomain.ProviderBuild || firstTokenMS == nil || outputTokens <= 0 || durationMS <= *firstTokenMS {
 		return
@@ -1234,8 +1234,10 @@ attemptLoop:
 				// Only a successful, measured stream is a Resin rotation signal.
 				// External request failures remain ordinary audit/health events and
 				// never cause an IP refresh.
-				if silenceTimedOut && !input.AdminQualityTest {
-					s.rotateResinForSignal(ctx, credential, "silent_stream")
+				if silenceTimedOut {
+					// A pre-first-token silence is recorded as a stream failure, but
+					// deliberately does not rotate Resin. Only measured generation
+					// speed and response-header timeout are rotation signals.
 				} else if successful && input.Streaming && !input.AdminQualityTest {
 					s.observeResinTokenSpeed(ctx, credential, record.FirstTokenMS, record.DurationMS, usage.OutputTokens)
 				} else if successful && !input.Streaming && !input.AdminQualityTest && credential.Provider == accountdomain.ProviderBuild && responseHeaderWait >= resinSlowResponseHeaderThreshold {
