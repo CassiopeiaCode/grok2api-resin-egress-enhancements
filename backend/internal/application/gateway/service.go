@@ -841,7 +841,16 @@ attemptLoop:
 		var err error
 		selectionStarted := time.Now()
 		if input.ForcedAccountID != 0 {
-			lease, err = s.selector.AcquirePinnedForKey(ctx, route.Provider, input.ForcedAccountID, route.ID, route.UpstreamModel, quotaMode, true, accountScope)
+			// Admin quality tests deliberately probe an account even when the
+			// ordinary scheduler has put it in cooldown or model-quota recovery.
+			// The upstream response remains real, but this diagnostic request must
+			// not be blocked by production routing state or consume its quota lease.
+			lease, err = s.selector.AcquirePinnedForKey(ctx, route.Provider, input.ForcedAccountID, route.ID, route.UpstreamModel, quotaMode, !input.AdminQualityTest, accountScope)
+			if err == nil && input.AdminQualityTest {
+				lease.QuotaMode = ""
+				lease.QuotaProbe = false
+				lease.QuotaProbeKind = ""
+			}
 		} else if ownership != nil {
 			lease, err = s.selector.AcquirePinnedForKey(ctx, route.Provider, ownership.AccountID, route.ID, route.UpstreamModel, quotaMode, true, accountScope)
 		} else {
@@ -855,6 +864,7 @@ attemptLoop:
 			break
 		}
 		excluded[lease.Credential.ID] = true
+		if !input.AdminQualityTest {
 		if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
 			lease.Release()
 			lastFailure = &UpstreamFailure{
@@ -872,6 +882,7 @@ attemptLoop:
 			}
 			attempt--
 			continue
+		}
 		}
 		if lease.QuotaProbe {
 			quotaProbeAttempted = true
@@ -899,7 +910,7 @@ attemptLoop:
 		if err != nil {
 			lease.Release()
 			lastErr = err
-			if neterrorpkg.IsResponseHeaderTimeout(err) {
+			if neterrorpkg.IsResponseHeaderTimeout(err) && !input.AdminQualityTest {
 				s.rotateResinForSignal(ctx, credential, "response_header_timeout")
 			}
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
@@ -958,7 +969,7 @@ attemptLoop:
 					lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
 					break
 				} else {
-					if neterrorpkg.IsResponseHeaderTimeout(err) {
+					if neterrorpkg.IsResponseHeaderTimeout(err) && !input.AdminQualityTest {
 						s.rotateResinForSignal(ctx, credential, "response_header_timeout")
 					}
 					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
@@ -1001,8 +1012,10 @@ attemptLoop:
 				// Fall through to the common success/error response path so the client receives the original 403.
 			} else if lastFailure.AccountBlocked {
 				failureHandled := s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
-				if lastFailure.AccountScoped && !failureHandled {
-					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				if lastFailure.AccountScoped && !failureHandled && !input.AdminQualityTest {
+					if !input.AdminQualityTest {
+						s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+					}
 				}
 				lease.Release()
 				lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
@@ -1097,7 +1110,9 @@ attemptLoop:
 			}
 			failureHandled := false
 			if freeBuildForbidden {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+					if !input.AdminQualityTest {
+						s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+					}
 				failureHandled = true
 			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
@@ -1136,7 +1151,7 @@ attemptLoop:
 			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
 				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s credential rejected", credential.Provider))
 			}
-			if lastFailure.AccountScoped && !failureHandled {
+			if lastFailure.AccountScoped && !failureHandled && !input.AdminQualityTest {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			}
 			lease.Release()
@@ -1174,7 +1189,7 @@ attemptLoop:
 				}
 				lease.completeSelectorObservation(successful)
 				budget := newFinalizationBudget(string(operation), string(route.Provider))
-				if isUpstreamStreamFailure(errorCode) {
+				if isUpstreamStreamFailure(errorCode) && !input.AdminQualityTest {
 					if err := budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
 						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, http.StatusBadGateway, 0)
 					}); err != nil {
@@ -1219,11 +1234,11 @@ attemptLoop:
 				// Only a successful, measured stream is a Resin rotation signal.
 				// External request failures remain ordinary audit/health events and
 				// never cause an IP refresh.
-				if silenceTimedOut {
+				if silenceTimedOut && !input.AdminQualityTest {
 					s.rotateResinForSignal(ctx, credential, "silent_stream")
-				} else if successful && input.Streaming {
+				} else if successful && input.Streaming && !input.AdminQualityTest {
 					s.observeResinTokenSpeed(ctx, credential, record.FirstTokenMS, record.DurationMS, usage.OutputTokens)
-				} else if successful && !input.Streaming && credential.Provider == accountdomain.ProviderBuild && responseHeaderWait >= resinSlowResponseHeaderThreshold {
+				} else if successful && !input.Streaming && !input.AdminQualityTest && credential.Provider == accountdomain.ProviderBuild && responseHeaderWait >= resinSlowResponseHeaderThreshold {
 					s.rotateResinForSignal(ctx, credential, "slow_response_headers")
 				}
 				attempts := failureAttempts.snapshot()
