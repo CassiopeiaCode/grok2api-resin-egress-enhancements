@@ -17,10 +17,12 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
 	mediaapp "github.com/chenyme/grok2api/backend/internal/application/media"
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
+	pelicanapp "github.com/chenyme/grok2api/backend/internal/application/pelican"
 	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
 	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
 	accounthttp "github.com/chenyme/grok2api/backend/internal/transport/http/account"
 	adminauthhttp "github.com/chenyme/grok2api/backend/internal/transport/http/adminauth"
+	adminqualityhttp "github.com/chenyme/grok2api/backend/internal/transport/http/adminquality"
 	audithttp "github.com/chenyme/grok2api/backend/internal/transport/http/audit"
 	clientkeyhttp "github.com/chenyme/grok2api/backend/internal/transport/http/clientkey"
 	dashboardhttp "github.com/chenyme/grok2api/backend/internal/transport/http/dashboard"
@@ -29,9 +31,9 @@ import (
 	mediahttp "github.com/chenyme/grok2api/backend/internal/transport/http/media"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
 	modelhttp "github.com/chenyme/grok2api/backend/internal/transport/http/model"
+	pelicanhttp "github.com/chenyme/grok2api/backend/internal/transport/http/pelican"
 	settingshttp "github.com/chenyme/grok2api/backend/internal/transport/http/settings"
 	systemhttp "github.com/chenyme/grok2api/backend/internal/transport/http/system"
-	adminqualityhttp "github.com/chenyme/grok2api/backend/internal/transport/http/adminquality"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -62,6 +64,7 @@ type Dependencies struct {
 	Settings     *settingsapp.Service
 	Egress       *egressapp.Service
 	Updates      *updatecheckapp.Service
+	Pelican      *pelicanapp.Service
 }
 
 type ReadinessComponent struct {
@@ -161,6 +164,9 @@ func New(deps Dependencies) *gin.Engine {
 		return deps.PublicAPIBaseURL
 	}, deps.Updates).Register(adminProtected)
 	adminqualityhttp.NewHandler(deps.Gateway, inferenceHandler, deps.ClientKeys).Register(adminProtected)
+	if deps.Pelican != nil {
+		pelicanhttp.NewHandler(deps.Pelican).Register(adminProtected)
+	}
 
 	v1 := router.Group("/v1")
 	v1.Use(deps.ConcurrencyGate.Middleware())

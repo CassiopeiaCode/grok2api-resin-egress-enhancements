@@ -49,6 +49,7 @@ var schemaModels = []any{
 	&mediaAssetModel{},
 	&mediaUploadTicketModel{},
 	&runtimeSettingsModel{},
+	&pelicanEgressEntryModel{},
 }
 
 var schemaIndexes = []string{
@@ -95,6 +96,7 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_media_assets_kind_created ON media_assets(kind, created_at DESC, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_upload_tickets_expires ON media_upload_tickets(expires_at, consumed_at)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_result_asset ON media_jobs(result_asset_id) WHERE result_asset_id <> ''",
+	"CREATE INDEX IF NOT EXISTS idx_pelican_entries_active_due ON pelican_egress_entries(status, next_check_at, id)",
 	// Pending input metadata rows only; keeps startup backfill scans off the full table after migration completes.
 	mediaJobInputMetadataPendingIndex,
 }

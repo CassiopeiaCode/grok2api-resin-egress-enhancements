@@ -19,6 +19,7 @@ import (
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
+	"github.com/chenyme/grok2api/backend/internal/application/pelican"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
@@ -111,10 +112,10 @@ type Input struct {
 	// AdminQualityTest enables an administrator-only diagnostic request. It
 	// bypasses client-key billing and can pin both the upstream account and
 	// Resin egress identity for reproducible experiments.
-	AdminQualityTest       bool
-	ForcedAccountID        uint64
-	ForcedEgressNodeID     uint64
-	ForcedProxyUsername    string
+	AdminQualityTest    bool
+	ForcedAccountID     uint64
+	ForcedEgressNodeID  uint64
+	ForcedProxyUsername string
 }
 
 type Usage struct {
@@ -202,6 +203,7 @@ type Service struct {
 	rateLimitTeams       map[uint64]teamRateLimitObservation
 	modelSyncMu          sync.Mutex
 	modelSyncing         map[uint64]struct{}
+	pelican              *pelican.Service
 }
 
 type teamModelRateLimit struct {
@@ -234,12 +236,15 @@ func (s *Service) ConfigureMediaAssets(store videoAssetStore) {
 	s.mediaAssets = store
 }
 
-func NewService(models routeResolver, audits auditRecorder, accounts *accountapp.Service, clientKeys *clientkeyapp.Service, providers *provider.Registry, selector *Selector, responses repository.ResponseRepository, maxAttempts int) *Service {
+func NewService(models routeResolver, audits auditRecorder, accounts *accountapp.Service, clientKeys *clientkeyapp.Service, providers *provider.Registry, selector *Selector, responses repository.ResponseRepository, maxAttempts int, pelicanService ...*pelican.Service) *Service {
 	service := &Service{
 		models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers,
 		selector: selector, responses: responses, logger: slog.Default(),
 		rateLimits: make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]teamRateLimitObservation),
 		modelSyncing: make(map[uint64]struct{}),
+	}
+	if len(pelicanService) > 0 {
+		service.pelican = pelicanService[0]
 	}
 	service.UpdateMaxAttempts(maxAttempts)
 	return service
@@ -784,6 +789,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if input.ForcedEgressNodeID != 0 {
 		physicalCallCtx = infraegress.WithEgressNode(physicalCallCtx, input.ForcedEgressNodeID)
 	}
+	basePhysicalCallCtx := physicalCallCtx
 	supportsStoredResponses := s.providers.SupportsStoredResponses(route.Provider)
 	if input.PreviousResponseID != "" && !supportsStoredResponses {
 		return nil, ErrResponseStateUnsupported
@@ -795,16 +801,16 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	}
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
 	if !input.AdminQualityTest {
-	if err := s.checkLedgerReady(); err != nil {
-		return nil, err
-	}
-	}
-	if !input.AdminQualityTest {
-	if reservation, priced := audit.EstimateOfficialTextReservation(pricingModel, input.Body); priced {
-		if _, err := s.clientKeys.ReserveBilling(ctx, input.ClientKey, eventID, reservation.CostInUSDTicks, s.textBillingReservationTTL()); err != nil {
+		if err := s.checkLedgerReady(); err != nil {
 			return nil, err
 		}
 	}
+	if !input.AdminQualityTest {
+		if reservation, priced := audit.EstimateOfficialTextReservation(pricingModel, input.Body); priced {
+			if _, err := s.clientKeys.ReserveBilling(ctx, input.ClientKey, eventID, reservation.CostInUSDTicks, s.textBillingReservationTTL()); err != nil {
+				return nil, err
+			}
+		}
 	}
 	excluded := make(map[uint64]bool)
 	failureFingerprints := make(map[string]int)
@@ -865,24 +871,24 @@ attemptLoop:
 		}
 		excluded[lease.Credential.ID] = true
 		if !input.AdminQualityTest {
-		if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
-			lease.Release()
-			lastFailure = &UpstreamFailure{
-				HTTPStatus: http.StatusTooManyRequests, Code: "upstream_rate_limited", PublicMessage: "上游请求频率受限",
-				AccountID: lease.Credential.ID, AccountName: lease.Credential.Name,
-				Fingerprint: "429:team_model_rate_limit", RetryAfter: time.Until(limited.Until),
+			if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
+				lease.Release()
+				lastFailure = &UpstreamFailure{
+					HTTPStatus: http.StatusTooManyRequests, Code: "upstream_rate_limited", PublicMessage: "上游请求频率受限",
+					AccountID: lease.Credential.ID, AccountName: lease.Credential.Name,
+					Fingerprint: "429:team_model_rate_limit", RetryAfter: time.Until(limited.Until),
+				}
+				lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
+				s.logger.Warn("upstream_team_model_rate_limit_active", "request_id", input.RequestID, "provider", route.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "retry_after", lastFailure.RetryAfter.Round(time.Second))
+				// Stored Responses are pinned to one account. Return the cached 429
+				// immediately instead of spinning until the cooldown expires or
+				// replaying the request on the same account.
+				if ownership != nil {
+					break attemptLoop
+				}
+				attempt--
+				continue
 			}
-			lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
-			s.logger.Warn("upstream_team_model_rate_limit_active", "request_id", input.RequestID, "provider", route.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "retry_after", lastFailure.RetryAfter.Round(time.Second))
-			// Stored Responses are pinned to one account. Return the cached 429
-			// immediately instead of spinning until the cooldown expires or
-			// replaying the request on the same account.
-			if ownership != nil {
-				break attemptLoop
-			}
-			attempt--
-			continue
-		}
 		}
 		if lease.QuotaProbe {
 			quotaProbeAttempted = true
@@ -905,6 +911,12 @@ attemptLoop:
 			lastErr = err
 			lastFailure = newCredentialUpstreamFailure(err, lease.Credential.ID, lease.Credential.Name)
 			continue
+		}
+		if s.pelican != nil && credential.Provider == accountdomain.ProviderBuild && input.ForcedProxyUsername == "" && !input.AdminQualityTest {
+			physicalCallCtx = basePhysicalCallCtx
+			if username, poolErr := s.pelican.Select(ctx, credential.ID); poolErr == nil && username != "" {
+				physicalCallCtx = infraegress.WithAccountIdentity(physicalCallCtx, username)
+			}
 		}
 		response, err := forwardResponse(lease, credential, lease.Billing)
 		if err != nil {
@@ -1110,9 +1122,9 @@ attemptLoop:
 			}
 			failureHandled := false
 			if freeBuildForbidden {
-					if !input.AdminQualityTest {
-						s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
-					}
+				if !input.AdminQualityTest {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				}
 				failureHandled = true
 			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)

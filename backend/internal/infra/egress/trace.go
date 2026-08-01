@@ -42,6 +42,12 @@ func WithAccount(ctx context.Context, provider string, accountID uint64) context
 // WithCredential passes the stable egress identity of a weakly linked account to Build transport;
 // unlinked accounts retain the existing Provider+ID identity.
 func WithCredential(ctx context.Context, credential accountdomain.Credential) context.Context {
+	if forced := accountFromContext(ctx); forced != "" {
+		// Gateway/admin quality tests and the Pelican pool may deliberately pin
+		// a Resin username. Provider adapters must not overwrite that identity
+		// while attaching the credential's default account identity.
+		return WithEgressNode(ctx, credential.EgressNodeID)
+	}
 	identity := strings.TrimSpace(credential.EgressIdentity)
 	if identity == "" {
 		provider := credential.Provider

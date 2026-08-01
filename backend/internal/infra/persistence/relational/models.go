@@ -57,13 +57,28 @@ type accountModel struct {
 	EgressNodeID         *uint64 `gorm:"index:idx_accounts_egress_node"`
 	EgressAssignmentMode string  `gorm:"size:16;not null;default:'';check:chk_accounts_egress_assignment_mode,egress_assignment_mode IN ('','manual','auto')"`
 	EgressAssignedAt     *time.Time
-	ResinAccountSuffix string `gorm:"size:64;not null;default:'';check:chk_accounts_resin_account_suffix,length(resin_account_suffix) <= 64"`
+	ResinAccountSuffix   string                  `gorm:"size:64;not null;default:'';check:chk_accounts_resin_account_suffix,length(resin_account_suffix) <= 64"`
 	CreatedAt            time.Time               `gorm:"not null"`
 	UpdatedAt            time.Time               `gorm:"not null"`
 	Credential           *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 	WebProfile           *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 	EgressNode           *egressNodeModel        `gorm:"foreignKey:EgressNodeID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
 }
+
+type pelicanEgressEntryModel struct {
+	ID            uint64  `gorm:"primaryKey;autoIncrement"`
+	ProxyUsername string  `gorm:"size:128;uniqueIndex;not null;check:chk_pelican_username,length(trim(proxy_username)) BETWEEN 1 AND 128"`
+	Label         string  `gorm:"size:16;not null;check:chk_pelican_label,label IN ('good','bad','uncertain')"`
+	Confidence    float64 `gorm:"not null;check:chk_pelican_confidence,confidence >= 0 AND confidence <= 1"`
+	ClassifierVer string  `gorm:"size:128;not null;default:''"`
+	Status        string  `gorm:"size:16;not null;default:'active';check:chk_pelican_status,status IN ('active','probing','removed')"`
+	LastCheckedAt *time.Time
+	NextCheckAt   time.Time `gorm:"index:idx_pelican_due"`
+	CreatedAt     time.Time `gorm:"not null"`
+	UpdatedAt     time.Time `gorm:"not null"`
+}
+
+func (pelicanEgressEntryModel) TableName() string { return "pelican_egress_entries" }
 
 func (accountModel) TableName() string { return "provider_accounts" }
 
