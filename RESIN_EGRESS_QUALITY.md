@@ -8,7 +8,6 @@
 
 部署中观察到一种可操作的质量信号：部分 Grok Build 出口返回 token 的速度异常高，同时生成质量明显下降。本分支将它作为“降智出口”的判定信号：
 
-- 实测生成阶段不短于 1 秒；
 - 输出速度大于 `200 tokens/s`；
 - 请求本身已经成功完成。
 
@@ -95,12 +94,12 @@ tokens_per_second = output_tokens × 1000 / measured_ms
 轮换条件：
 
 ```text
-measured_ms >= 1000
+measured_ms > 0
 tokens_per_second > 200
 请求成功完成
 ```
 
-少于 1 秒的样本不会参与判断，因为计时粒度、批量 Flush 和短回答会使速度值失真。
+不再设置 1 秒最短生成时长。只要首 token 已记录、总耗时大于首 token 时间，并且计算出的速度严格大于 200 tokens/s，就立即轮换。极短响应可能受计时粒度影响，因此速度阈值本身仍使用严格的大于比较。
 
 失败流、客户端取消、无法解析的 token 数和不完整响应不会被当作“高速降智”样本。
 
@@ -221,7 +220,7 @@ Grok Build 使用“最近使用优先”的账号选择策略：
 
 | 信号 | 触发条件 |
 |---|---|
-| `fast_stream` | 成功 Build 流的生成阶段至少 1 秒，且速度大于 200 tokens/s |
+| `fast_stream` | 成功 Build 流的生成阶段耗时大于 0，且速度大于 200 tokens/s |
 | `response_header_timeout` | Build、Web 或 Console 单次等待响应头超过 10 秒 |
 | `silent_stream` | Build 收到响应头后 60 秒没有完整 SSE 事件 |
 | `slow_response_headers` | 成功的 Build 非流式响应头等待至少 60 秒 |
@@ -244,4 +243,3 @@ Grok Build 使用“最近使用优先”的账号选择策略：
 - Web/Console 10 秒响应头计时：`backend/internal/infra/egress/tlsclient.go`
 - 账号族事务轮换：`backend/internal/infra/persistence/relational/account_repository.go`
 - 流式实时写入与 Flush：`backend/internal/transport/http/inference/handler.go`
-

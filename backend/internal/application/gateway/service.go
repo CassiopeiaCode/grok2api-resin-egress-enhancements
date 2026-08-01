@@ -58,7 +58,6 @@ const unlimitedRoutingAttempts = -1
 // separately because they are an explicit transport signal for every
 // provider sharing the same Resin account identity.
 const resinFastStreamThreshold = 200.0
-const resinMinimumMeasuredDurationMS int64 = 1000
 
 // resinSlowResponseHeaderThreshold is the non-streaming counterpart to the
 // 60-second streaming silence deadline. A successful Build response whose
@@ -287,12 +286,6 @@ func (s *Service) observeResinTokenSpeed(ctx context.Context, credential account
 		return
 	}
 	measuredMS := durationMS - *firstTokenMS
-	// Very short generations make outputTokens / elapsed time dominated by
-	// timer and flush granularity. Treat them as unmeasured rather than
-	// rotating a healthy Resin identity on a noisy sample.
-	if measuredMS < resinMinimumMeasuredDurationMS {
-		return
-	}
 	speed := float64(outputTokens) * 1000 / float64(measuredMS)
 	if speed <= resinFastStreamThreshold {
 		return
