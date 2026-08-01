@@ -264,7 +264,7 @@ Grok Build 使用“最近使用优先”的账号选择策略：
 ## 关键代码位置
 
 - Build token 速度观测与轮换信号：`backend/internal/application/gateway/service.go`
-- 60 秒 SSE 静默监测：`backend/internal/application/gateway/stream_silence.go`
+- 90 秒 SSE 静默监测：`backend/internal/application/gateway/stream_silence.go`
 - Build 代理身份拼接：`backend/internal/infra/egress/trace.go`
 - Web/Console 代理身份拼接：`backend/internal/infra/egress/manager.go`
 - Web/Console 10 秒响应头计时：`backend/internal/infra/egress/tlsclient.go`

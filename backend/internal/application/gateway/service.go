@@ -61,7 +61,7 @@ const resinFastStreamThreshold = 200.0
 const resinMinimumMeasuredDurationMS int64 = 100
 
 // resinSlowResponseHeaderThreshold is the non-streaming counterpart to the
-// 60-second streaming silence deadline. A successful Build response whose
+// 90-second streaming silence deadline. A successful Build response whose
 // HTTP headers take at least this long is still returned to the caller, but
 // the account's Resin identity is rotated for subsequent requests. The
 // current request is never replayed, so a slow response cannot be duplicated

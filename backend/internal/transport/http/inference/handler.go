@@ -1020,7 +1020,7 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		if metadata.StreamFailure != nil && result.RecordStreamFailure != nil {
 			result.RecordStreamFailure(*metadata.StreamFailure)
 		}
-		// A 60-second Build stream silence can happen before the upstream sends
+		// A 90-second Build stream silence can happen before the upstream sends
 		// its first SSE event. In that case no downstream bytes have been
 		// committed yet, so replace the otherwise-empty upstream 200 with a
 		// normal gateway error. This keeps the Resin rotation signal while
@@ -1028,9 +1028,9 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		if copyErr != nil && result.StreamSilenceTimedOut != nil && result.StreamSilenceTimedOut() && !c.Writer.Written() {
 			errorCode = "upstream_stream_silent"
 			if anthropic {
-				writeAnthropicError(c, http.StatusGatewayTimeout, "timeout_error", "上游流式响应在 60 秒内没有发送任何事件", "upstream_stream_silent")
+				writeAnthropicError(c, http.StatusGatewayTimeout, "timeout_error", "上游流式响应在 90 秒内没有发送任何事件", "upstream_stream_silent")
 			} else {
-				writeOpenAIError(c, http.StatusGatewayTimeout, "upstream_stream_silent", "上游流式响应在 60 秒内没有发送任何事件")
+				writeOpenAIError(c, http.StatusGatewayTimeout, "upstream_stream_silent", "上游流式响应在 90 秒内没有发送任何事件")
 			}
 			return
 		}

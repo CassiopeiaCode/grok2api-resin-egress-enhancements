@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const resinStreamSilenceTimeout = 60 * time.Second
+const resinStreamSilenceTimeout = 90 * time.Second
 
 // streamSilenceTracker watches complete upstream SSE data events. It starts
 // at the time the upstream response is handed to the HTTP layer, so silence
