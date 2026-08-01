@@ -10,7 +10,6 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
-	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/inference"
 	"github.com/gin-gonic/gin"
 )
@@ -86,7 +85,10 @@ func (h *Handler) request(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "invalid_proxy_username", "message": "proxy_username 无效或过长"}})
 		return
 	}
-	publicModel := modeldomain.ExternalPublicID(provider, meta.Model)
+	publicModel := meta.Model
+	if !strings.HasPrefix(strings.ToLower(publicModel), strings.ToLower(provider.ModelNamespace()+"/")) {
+		publicModel = provider.ModelNamespace() + "/" + publicModel
+	}
 	requestID := c.GetHeader("X-Request-ID")
 	if requestID == "" {
 		requestID = "admin-quality-" + strconv.FormatInt(time.Now().UnixNano(), 10)
