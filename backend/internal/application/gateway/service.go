@@ -58,6 +58,7 @@ const unlimitedRoutingAttempts = -1
 // separately because they are an explicit transport signal for every
 // provider sharing the same Resin account identity.
 const resinFastStreamThreshold = 200.0
+const resinMinimumMeasuredDurationMS int64 = 100
 
 // resinSlowResponseHeaderThreshold is the non-streaming counterpart to the
 // 60-second streaming silence deadline. A successful Build response whose
@@ -107,6 +108,13 @@ type Input struct {
 	// GrokTurnIndex forwards only the turn supplied by a real Grok Shell client; the server never infers or increments it.
 	GrokTurnIndex string
 	Operation     audit.Operation
+	// AdminQualityTest enables an administrator-only diagnostic request. It
+	// bypasses client-key billing and can pin both the upstream account and
+	// Resin egress identity for reproducible experiments.
+	AdminQualityTest       bool
+	ForcedAccountID        uint64
+	ForcedEgressNodeID     uint64
+	ForcedProxyUsername    string
 }
 
 type Usage struct {
@@ -286,6 +294,9 @@ func (s *Service) observeResinTokenSpeed(ctx context.Context, credential account
 		return
 	}
 	measuredMS := durationMS - *firstTokenMS
+	if measuredMS < resinMinimumMeasuredDurationMS {
+		return
+	}
 	speed := float64(outputTokens) * 1000 / float64(measuredMS)
 	if speed <= resinFastStreamThreshold {
 		return
@@ -767,6 +778,12 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		return nil, ErrNoAvailableAccount
 	}
 	physicalCallCtx := infraegress.WithPhysicalCallTrace(ctx, string(route.Provider), string(operation))
+	if input.ForcedProxyUsername != "" {
+		physicalCallCtx = infraegress.WithAccountIdentity(physicalCallCtx, input.ForcedProxyUsername)
+	}
+	if input.ForcedEgressNodeID != 0 {
+		physicalCallCtx = infraegress.WithEgressNode(physicalCallCtx, input.ForcedEgressNodeID)
+	}
 	supportsStoredResponses := s.providers.SupportsStoredResponses(route.Provider)
 	if input.PreviousResponseID != "" && !supportsStoredResponses {
 		return nil, ErrResponseStateUnsupported
@@ -777,13 +794,17 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		attemptPolicy = newRoutingAttemptPolicy(1)
 	}
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
+	if !input.AdminQualityTest {
 	if err := s.checkLedgerReady(); err != nil {
 		return nil, err
 	}
+	}
+	if !input.AdminQualityTest {
 	if reservation, priced := audit.EstimateOfficialTextReservation(pricingModel, input.Body); priced {
 		if _, err := s.clientKeys.ReserveBilling(ctx, input.ClientKey, eventID, reservation.CostInUSDTicks, s.textBillingReservationTTL()); err != nil {
 			return nil, err
 		}
+	}
 	}
 	excluded := make(map[uint64]bool)
 	failureFingerprints := make(map[string]int)
@@ -819,7 +840,9 @@ attemptLoop:
 		var lease *accountLease
 		var err error
 		selectionStarted := time.Now()
-		if ownership != nil {
+		if input.ForcedAccountID != 0 {
+			lease, err = s.selector.AcquirePinnedForKey(ctx, route.Provider, input.ForcedAccountID, route.ID, route.UpstreamModel, quotaMode, true, accountScope)
+		} else if ownership != nil {
 			lease, err = s.selector.AcquirePinnedForKey(ctx, route.Provider, ownership.AccountID, route.ID, route.UpstreamModel, quotaMode, true, accountScope)
 		} else {
 			lease, err = s.selector.AcquireForKey(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted, accountScope)

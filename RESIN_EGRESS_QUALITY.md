@@ -94,12 +94,39 @@ tokens_per_second = output_tokens × 1000 / measured_ms
 轮换条件：
 
 ```text
-measured_ms > 0
+measured_ms >= 100
 tokens_per_second > 200
+
+## 管理员强制质量实验接口
+
+管理员认证后可调用 `POST /api/admin/v1/quality-tests/requests`。接口复用普通
+Gateway 的响应、SSE、首 token、输出 token 和审计 finalize 链路；只跳过客户端
+计费预扣，不会在接口层重新计算 token。
+
+请求示例：
+
+```json
+{
+  "provider": "grok_build",
+  "account_id": 100956,
+  "egress_node_id": 12,
+  "proxy_username": "Default.100956.switch-a",
+  "request": {
+    "model": "grok-4.5",
+    "stream": true,
+    "input": [{"role": "user", "content": "画一个鹈鹕骑自行车的svg"}]
+  }
+}
+```
+
+`proxy_username` 是可选的，但在实验时建议显式填写；它直接覆盖 Resin
+`{account}` 占位符，因此可以在同一个账号/同一个节点上手工切换不同出口身份。
+`egress_node_id` 也是可选的，仅用于强制指定 Resin 节点。响应体（包括流式 SSE）
+原样按普通推理接口转发，审计中仍记录实际账号、节点、首 token 和输出 token。
 请求成功完成
 ```
 
-不再设置 1 秒最短生成时长。只要首 token 已记录、总耗时大于首 token 时间，并且计算出的速度严格大于 200 tokens/s，就立即轮换。极短响应可能受计时粒度影响，因此速度阈值本身仍使用严格的大于比较。
+不再设置 1 秒最短生成时长，但保留 `100 ms` 的最小有效测量窗口。`measured_ms < 100` 的样本直接忽略，不参与速度判断，也不会刷 IP；`measured_ms >= 100` 且速度严格大于 200 tokens/s 才会轮换。这样可以过滤 1–99 ms 的明显计时粒度和批量 Flush 噪声。
 
 失败流、客户端取消、无法解析的 token 数和不完整响应不会被当作“高速降智”样本。
 
@@ -220,7 +247,7 @@ Grok Build 使用“最近使用优先”的账号选择策略：
 
 | 信号 | 触发条件 |
 |---|---|
-| `fast_stream` | 成功 Build 流的生成阶段耗时大于 0，且速度大于 200 tokens/s |
+| `fast_stream` | 成功 Build 流的生成阶段至少 100 ms，且速度大于 200 tokens/s |
 | `response_header_timeout` | Build、Web 或 Console 单次等待响应头超过 10 秒 |
 | `silent_stream` | Build 收到响应头后 60 秒没有完整 SSE 事件 |
 | `slow_response_headers` | 成功的 Build 非流式响应头等待至少 60 秒 |

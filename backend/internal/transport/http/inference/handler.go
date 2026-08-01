@@ -965,6 +965,13 @@ func (h *Handler) writeResult(c *gin.Context, result *gateway.Result, stream boo
 	h.writeProtocolResult(c, result, stream, false, protocol)
 }
 
+// WriteAdminResult exposes the same bounded streaming/JSON transfer path to
+// the authenticated admin quality-test endpoint. It intentionally does not
+// alter the normal public API surface.
+func (h *Handler) WriteAdminResult(c *gin.Context, result *gateway.Result, stream bool) {
+	h.writeResult(c, result, stream, streamProtocolResponses)
+}
+
 func (h *Handler) writeAnthropicResult(c *gin.Context, result *gateway.Result, stream bool) {
 	h.writeProtocolResult(c, result, stream, true, streamProtocolAnthropic)
 }

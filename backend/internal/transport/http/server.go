@@ -31,6 +31,7 @@ import (
 	modelhttp "github.com/chenyme/grok2api/backend/internal/transport/http/model"
 	settingshttp "github.com/chenyme/grok2api/backend/internal/transport/http/settings"
 	systemhttp "github.com/chenyme/grok2api/backend/internal/transport/http/system"
+	adminqualityhttp "github.com/chenyme/grok2api/backend/internal/transport/http/adminquality"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -134,6 +135,10 @@ func New(deps Dependencies) *gin.Engine {
 	}
 	mediaHandler := mediahttp.NewHandler(deps.Media)
 	mediaHandler.RegisterPublic(router)
+	inferenceHandler := inference.NewHandler(deps.Gateway, deps.Models, deps.MaxBodyBytes, deps.PublicAPIBaseURL)
+	if deps.Settings != nil {
+		inferenceHandler.SetPublicAPIBaseURLResolver(deps.Settings.PublicAPIBaseURL)
+	}
 
 	adminRoot := router.Group("/api/admin/v1")
 	authHandler := adminauthhttp.NewHandler(deps.AdminAuth, deps.SecureCookies)
@@ -155,6 +160,7 @@ func New(deps Dependencies) *gin.Engine {
 		}
 		return deps.PublicAPIBaseURL
 	}, deps.Updates).Register(adminProtected)
+	adminqualityhttp.NewHandler(deps.Gateway, inferenceHandler).Register(adminProtected)
 
 	v1 := router.Group("/v1")
 	v1.Use(deps.ConcurrencyGate.Middleware())
@@ -171,10 +177,6 @@ func New(deps Dependencies) *gin.Engine {
 		})
 	}
 	v1.Use(middleware.ClientAuth(deps.ClientKeys))
-	inferenceHandler := inference.NewHandler(deps.Gateway, deps.Models, deps.MaxBodyBytes, deps.PublicAPIBaseURL)
-	if deps.Settings != nil {
-		inferenceHandler.SetPublicAPIBaseURLResolver(deps.Settings.PublicAPIBaseURL)
-	}
 	inferenceHandler.Register(v1)
 	registerFrontend(router, deps.FrontendStaticPath)
 	return router

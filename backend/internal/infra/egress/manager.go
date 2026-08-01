@@ -287,6 +287,14 @@ func (m *Manager) Acquire(ctx context.Context, scope domain.Scope, affinity stri
 // Provider credential. Resin templates use this identity as their Account.
 func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, credential accountdomain.Credential) (*Lease, error) {
 	identity := strings.TrimSpace(credential.EgressIdentity)
+	forcedIdentity := strings.TrimSpace(accountFromContext(ctx))
+	// An administrator quality test may deliberately override the Resin
+	// username (for example, account plus a hand-picked switch suffix).
+	// Ordinary requests never set this context value, so their persisted
+	// account identity behavior is unchanged.
+	if forcedIdentity != "" {
+		identity = forcedIdentity
+	}
 	if identity == "" {
 		identity = string(credential.Provider) + "_" + strconv.FormatUint(credential.ID, 10)
 	}
@@ -306,12 +314,18 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 	// linked login. Append the persisted suffix here as well as in the Build
 	// RoundTripper path, so a rotation observed by any channel changes the
 	// sticky proxy identity for all three channels.
+	if forcedIdentity == "" {
 	if suffix := strings.TrimSpace(credential.ResinAccountSuffix); suffix != "" {
 		identity += "_" + suffix
 	}
+	}
 	ctx = WithAccountIdentity(ctx, identity)
-	ctx = WithEgressNode(ctx, credential.EgressNodeID)
-	lease, _, err := m.acquire(ctx, scope, strconv.FormatUint(credential.ID, 10), true, credential.EncryptedCloudflareCookie, credential.EgressNodeID)
+	nodeID := credential.EgressNodeID
+	if forcedNode := egressNodeFromContext(ctx); forcedNode != 0 {
+		nodeID = forcedNode
+	}
+	ctx = WithEgressNode(ctx, nodeID)
+	lease, _, err := m.acquire(ctx, scope, strconv.FormatUint(credential.ID, 10), true, credential.EncryptedCloudflareCookie, nodeID)
 	return lease, err
 }
 
