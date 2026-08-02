@@ -115,7 +115,7 @@ func TestForwardResponseMatchesGrokBuildHeadersAndPreservesReasoning(t *testing.
 				t.Fatalf("legacy header %s = %q", legacy, r.Header.Get(legacy))
 			}
 		}
-		if r.Header.Get("x-grok-user-id") != "user-123" || r.Header.Get("x-grok-turn-idx") != "7" || r.Header.Get("x-userid") != "" || r.Header.Get("Accept-Encoding") != "gzip" || len(r.Header.Get("traceparent")) != 55 {
+		if r.Header.Get("x-grok-user-id") != "user-123" || r.Header.Get("x-grok-turn-idx") != "7" || r.Header.Get("x-userid") != "" || r.Header.Get("Accept-Encoding") != "identity" || len(r.Header.Get("traceparent")) != 55 {
 			t.Fatalf("protocol headers = %#v", r.Header)
 		}
 		if _, ok := r.Header["Tracestate"]; ok {
@@ -613,7 +613,7 @@ func TestForwardResponseDecodesExplicitGzipResponse(t *testing.T) {
 	}
 	adapter := NewAdapter(Config{BaseURL: "https://cli-chat-proxy.grok.com/v1"}, cipher)
 	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.Header.Get("Accept-Encoding") != "gzip" {
+		if request.Header.Get("Accept-Encoding") != "identity" {
 			t.Fatalf("Accept-Encoding = %q", request.Header.Get("Accept-Encoding"))
 		}
 		return &http.Response{

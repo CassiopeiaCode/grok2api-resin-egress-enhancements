@@ -800,7 +800,10 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 		}
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Encoding", "gzip")
+	// Build responses default to identity encoding. Streaming requests already
+	// enforce identity in doResponseRequest; keeping the base header identical
+	// also disables upstream compression for non-streaming Build requests.
+	req.Header.Set("Accept-Encoding", "identity")
 	req.Header.Set("User-Agent", cfg.UserAgent)
 	if model != "" {
 		req.Header.Set("x-grok-model-override", model)
