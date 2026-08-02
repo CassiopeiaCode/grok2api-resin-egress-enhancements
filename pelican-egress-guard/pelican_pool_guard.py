@@ -18,7 +18,11 @@ def accounts(client):
         cooldown=x.get("cooldownUntil", x.get("cooldown_until"))
         if not x.get("enabled", True): continue
         if str(x.get("authStatus", x.get("auth_status", "active"))).lower() not in {"active", ""}: continue
-        if int(x.get("failureCount", x.get("failure_count", 0)) or 0) > 0 or cooldown: continue
+        cooling=False
+        if cooldown:
+            try: cooling=dt.datetime.fromisoformat(str(cooldown).replace("Z","+00:00")).timestamp() > time.time()
+            except (TypeError,ValueError,OverflowError): cooling=True
+        if int(x.get("failureCount", x.get("failure_count", 0)) or 0) > 0 or cooling: continue
         if quota.get("remaining") is not None and float(quota.get("remaining") or 0) <= 0: continue
         out.append(x)
     return out
