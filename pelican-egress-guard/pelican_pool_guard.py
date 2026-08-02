@@ -69,9 +69,9 @@ def main():
     while True:
         try:
             pool=client.admin_request("GET", "/api/admin/v1/pelican-egress-pool").get("items", [])
-            due=[x for x in pool if due(x.get("next_check_at", x.get("nextCheckAt", x.get("NextCheckAt", ""))))]
-            if due:
-                item=due[0]; name=item.get("proxy_username", item.get("proxyUsername", item.get("ProxyUsername"))); aid=random.choice(accounts(client)).get("id")
+            due_items=[x for x in pool if due(x.get("next_check_at", x.get("nextCheckAt", x.get("NextCheckAt", ""))))]
+            if due_items:
+                item=due_items[0]; name=item.get("proxy_username", item.get("proxyUsername", item.get("ProxyUsername"))); aid=random.choice(accounts(client)).get("id")
                 good,label,conf,_=probe(client,classifier,aid,name)
                 client.admin_request("POST", "/api/admin/v1/pelican-egress-pool/results", {"proxy_username":name,"label":label,"confidence":conf,"classifier_version":"pelican-knn-v1"})
             elif len(pool)<3:
