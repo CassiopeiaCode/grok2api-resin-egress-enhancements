@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "prompt": "画一个鹈鹕骑自行车的svg",
+  "probe_interval_seconds": 600,
+  "request_timeout_seconds": 180,
+  "probe_stream": true,
+  "token_quality": {
+    "enabled": true,
+    "soft_tps": 200,
+    "hard_tps": 600,
+    "min_output_tokens": 32,
+    "note": "业务规则：低于 200 直接 good，200 到 600 直接 uncertain，高于 600 直接 bad；当前已启用"
+  },
+  "classification": {
+    "labels": ["good", "uncertain", "bad"],
+    "generation_failure": "bad",
+    "svg_extraction_failure": "bad",
+    "svg_parse_failure": "bad",
+    "request_timeout": "bad",
+    "unknown_uncertain_action": "keep",
+    "healthy_uncertain_action": "keep_until_3_then_rotate",
+    "healthy_bad_action": "rotate",
+    "rotating_good_action": "stop_and_keep",
+    "rotating_uncertain_action": "continue_rotate",
+    "rotating_bad_action": "continue_rotate"
+  },
+  "rotation": {
+    "max_duration_seconds": 540,
+    "delay_seconds": 3,
+    "uncertain_rotate_after_consecutive": 3,
+    "stop_when": "good",
+    "exhausted_action": "alert_and_wait_next_cycle"
+  },
+  "states": {
+    "unknown": "首次探测尚无结论",
+    "healthy": "当前用户名/IP 已通过",
+    "rotating": "正在连续更换用户名寻找 good",
+    "exhausted": "9 分钟预算耗尽仍未得到 good，等待下一监测周期并报警"
+  }
+}

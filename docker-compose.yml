@@ -17,6 +17,29 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  pelican-egress-guard:
+    build:
+      context: ./pelican-egress-guard
+      dockerfile: Dockerfile.pool
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+      GUARD_BASE_URL: http://grok2api:8000
+      GUARD_GROK_CONFIG_PATH: /run/grok2api/config.yaml
+      PELICAN_MODEL_PATH: /app/model/pelican-knn-v1.json
+      PELICAN_NODE_ID: "${PELICAN_NODE_ID:-33}"
+    volumes:
+      - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"
+    depends_on:
+      grok2api:
+        condition: service_started
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cpus: 0.5
+    mem_limit: 512m
+    memswap_limit: 512m
+
   # ================================ WARP ================================
   # 如果出口 IP 不干净，可取消以下注释使用 WARP 作为落地代理。
   # 启用后，在管理端“设置 -> 出口代理”中新增 socks5://warp:1080。
