@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Maintains the fixed-size Build Resin good-username pool."""
 from __future__ import annotations
-import os, random, secrets, time
+import os, random, secrets, time, datetime as dt
 from pathlib import Path
 from guard import GrokClient, KNNClassifier, extract_svg, http_sse, safe_log, now_iso, MODEL
 
@@ -25,6 +25,12 @@ def accounts(client):
 
 def username():
     return "Default.pelican-" + secrets.token_hex(16)
+
+def due(value):
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() <= time.time()
+    except (TypeError, ValueError, OverflowError):
+        return True
 
 def probe(client, classifier, account_id, proxy_username):
     body = {"provider":"grok_build", "account_id":int(account_id), "egress_node_id":NODE_ID, "proxy_username":proxy_username,
@@ -56,7 +62,7 @@ def main():
     while True:
         try:
             pool=client.admin_request("GET", "/api/admin/v1/pelican-egress-pool").get("items", [])
-            due=[x for x in pool if str(x.get("next_check_at", x.get("nextCheckAt", x.get("NextCheckAt", "")))) <= now_iso()]
+            due=[x for x in pool if due(x.get("next_check_at", x.get("nextCheckAt", x.get("NextCheckAt", ""))))]
             if due:
                 item=due[0]; name=item.get("proxy_username", item.get("proxyUsername", item.get("ProxyUsername"))); aid=random.choice(accounts(client)).get("id")
                 good,label,conf,_=probe(client,classifier,aid,name)
