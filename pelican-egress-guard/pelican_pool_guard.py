@@ -3,7 +3,7 @@
 from __future__ import annotations
 import os, random, secrets, time, datetime as dt
 from pathlib import Path
-from guard import GrokClient, KNNClassifier, extract_svg, http_sse, safe_log, now_iso, MODEL
+from guard import APIError, GrokClient, KNNClassifier, extract_svg, http_sse, safe_log, now_iso, MODEL
 
 PROMPT = "画一个鹈鹕骑自行车的svg"
 THRESHOLD = 0.60
@@ -57,6 +57,9 @@ def probe(client, classifier, account_id, proxy_username):
         good=label=="good" and confidence>=THRESHOLD
         safe_log("pelican_probe", account_id=int(account_id), label=label, confidence=round(confidence,4), good=good, elapsed_ms=int((time.monotonic()-started)*1000), username_hash=proxy_username[-12:])
         return good, label, confidence, details
+    except APIError as exc:
+        safe_log("pelican_probe_failed", account_id=int(account_id), elapsed_ms=int((time.monotonic()-started)*1000), error=type(exc).__name__, api_status=exc.status, api_code=exc.code)
+        return False, str(exc.code or "failed"), 0.0, {}
     except Exception as exc:
         safe_log("pelican_probe_failed", account_id=int(account_id), elapsed_ms=int((time.monotonic()-started)*1000), error=type(exc).__name__)
         return False, "failed", 0.0, {}
