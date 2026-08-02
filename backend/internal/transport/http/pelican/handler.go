@@ -49,7 +49,7 @@ func (h *Handler) result(c *gin.Context) {
 	}
 	in.ProxyUsername = strings.TrimSpace(in.ProxyUsername)
 	in.ExitIP = strings.TrimSpace(in.ExitIP)
-	if in.Label == "good" && in.Confidence >= .60 {
+	if in.Label == "good" && in.Confidence >= .55 {
 		if err := h.service.Admit(c.Request.Context(), in.ProxyUsername, in.ExitIP, in.Confidence, in.ClassifierVersion); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return

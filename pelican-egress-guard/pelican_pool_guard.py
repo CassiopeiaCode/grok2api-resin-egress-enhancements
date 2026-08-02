@@ -12,8 +12,8 @@ from pathlib import Path
 from guard import APIError, GrokClient, KNNClassifier, build_proxy_url, extract_svg, http_sse, safe_log, MODEL
 
 PROMPT = "画一个鹈鹕骑自行车的svg"
-THRESHOLD = 0.60
-INTERVAL = 600
+THRESHOLD = 0.55
+POOL_TARGET = int(os.environ.get("PELICAN_POOL_TARGET", "15"))
 NODE_ID = int(os.environ.get("PELICAN_NODE_ID", "33"))
 
 def accounts(client):
@@ -116,28 +116,11 @@ def main():
         try:
             pool=client.admin_request("GET", "/api/admin/v1/pelican-egress-pool").get("items", [])
             bad_ips=set(client.admin_request("GET", "/api/admin/v1/pelican-egress-pool/bad").get("items", []))
-            due_items=[x for x in pool if due(x.get("next_check_at", x.get("nextCheckAt", x.get("NextCheckAt", ""))))]
-            if due_items:
-                item=due_items[0]
-                name=item.get("proxy_username", item.get("proxyUsername", item.get("ProxyUsername")))
-                stored_ip=item.get("exit_ip", item.get("exitIp", item.get("ExitIP", ""))) or ""
-                exit_ip=trace_ip(name) or stored_ip
-                choices=accounts(client)
-                if choices and name:
-                    if exit_ip and exit_ip in bad_ips:
-                        label, conf = "bad", 1.0
-                        safe_log("pelican_active_bad_ip_evicted", exit_ip=exit_ip, username_hash=name[-12:])
-                    else:
-                        aid=random.choice(choices).get("id")
-                        good,label,conf,_=probe(client,classifier,aid,name)
-                        if good and not exit_ip:
-                            exit_ip=trace_ip(name)
-                        if good and not exit_ip:
-                            safe_log("pelican_good_without_exit_ip", username_hash=name[-12:])
-                            time.sleep(3)
-                            continue
-                    client.admin_request("POST", "/api/admin/v1/pelican-egress-pool/results", {"proxy_username":name,"exit_ip":exit_ip,"label":label,"confidence":conf,"classifier_version":"pelican-knn-v1"})
-            elif len(pool)<3:
+            # An admitted lease is not actively re-probed. Production Build
+            # streams are the ongoing quality signal; Grok2API evicts a lease
+            # after two consecutive measured streams above 200 tok/s. Once
+            # evicted, this loop observes the deficit and explores a replacement.
+            if len(pool) < POOL_TARGET:
                 choices=accounts(client)
                 if choices:
                     aid=random.choice(choices).get("id")
@@ -158,7 +141,7 @@ def main():
                             continue
                         client.admin_request("POST", "/api/admin/v1/pelican-egress-pool/results", {"proxy_username":name,"exit_ip":exit_ip,"label":label,"confidence":conf,"classifier_version":"pelican-knn-v1"})
                         break
-            time.sleep(3 if len(pool)<3 else 30)
+            time.sleep(3 if len(pool) < POOL_TARGET else 30)
         except Exception as exc:
             safe_log("pelican_pool_cycle_failed", error=type(exc).__name__); time.sleep(30)
 

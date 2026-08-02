@@ -291,10 +291,11 @@ func (s *Service) markReauthRequired(ctx context.Context, requestID string, cred
 
 // observeResinTokenSpeed attaches to ordinary gateway requests. It does not
 // issue a probe or replay the request: every incoming request is the sample.
-// A fast successful Build stream rotates the Resin identity. The measurement
-// is taken only after the first token, so pre-first-token silence is handled
-// separately and does not enter this signal.
-func (s *Service) observeResinTokenSpeed(ctx context.Context, credential accountdomain.Credential, firstTokenMS *int64, durationMS, outputTokens int64) {
+// A fast successful Build stream is attributed to the exact Pelican username
+// selected for that request. Two consecutive samples above the threshold
+// evict that lease; a normal measured sample resets its streak. If the good
+// pool is empty, preserve the legacy account-suffix rotation behavior.
+func (s *Service) observeResinTokenSpeed(ctx context.Context, credential accountdomain.Credential, pelicanUsername string, firstTokenMS *int64, durationMS, outputTokens int64) {
 	if credential.Provider != accountdomain.ProviderBuild || firstTokenMS == nil || outputTokens <= 0 || durationMS <= *firstTokenMS {
 		return
 	}
@@ -303,10 +304,47 @@ func (s *Service) observeResinTokenSpeed(ctx context.Context, credential account
 		return
 	}
 	speed := float64(outputTokens) * 1000 / float64(measuredMS)
+	if s.pelican != nil && strings.TrimSpace(pelicanUsername) != "" {
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountStateWriteTimeout)
+		defer cancel()
+		evicted, streak, err := s.pelican.ObserveStreamSpeed(writeCtx, pelicanUsername, speed, resinFastStreamThreshold)
+		if err != nil {
+			s.logger.Warn("pelican_stream_speed_observation_failed", "account_id", credential.ID, "speed", speed, "error", err)
+			return
+		}
+		if evicted {
+			s.logger.Info("pelican_lease_evicted", "account_id", credential.ID, "signal", "consecutive_fast_streams", "speed", speed, "streak", streak)
+		} else if streak > 0 {
+			s.logger.Info("pelican_fast_stream_observed", "account_id", credential.ID, "speed", speed, "streak", streak)
+		}
+		return
+	}
 	if speed <= resinFastStreamThreshold {
 		return
 	}
 	s.rotateResinForSignal(ctx, credential, "fast_stream")
+}
+
+func (s *Service) observePelicanResponseHeader(ctx context.Context, credential accountdomain.Credential, pelicanUsername string, timedOut bool) {
+	if s.pelican == nil || credential.Provider != accountdomain.ProviderBuild || strings.TrimSpace(pelicanUsername) == "" {
+		return
+	}
+	if !timedOut {
+		s.pelican.ResetResponseHeaderTimeout(pelicanUsername)
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountStateWriteTimeout)
+	defer cancel()
+	evicted, streak, err := s.pelican.ObserveResponseHeaderTimeout(writeCtx, pelicanUsername)
+	if err != nil {
+		s.logger.Warn("pelican_stream_header_timeout_observation_failed", "account_id", credential.ID, "error", err)
+		return
+	}
+	if evicted {
+		s.logger.Info("pelican_lease_evicted", "account_id", credential.ID, "signal", "consecutive_stream_header_timeouts", "streak", streak)
+	} else if streak > 0 {
+		s.logger.Info("pelican_stream_header_timeout_observed", "account_id", credential.ID, "streak", streak)
+	}
 }
 
 func (s *Service) rotateResinForSignal(ctx context.Context, credential accountdomain.Credential, signal string) {
@@ -912,9 +950,11 @@ attemptLoop:
 			lastFailure = newCredentialUpstreamFailure(err, lease.Credential.ID, lease.Credential.Name)
 			continue
 		}
+		pelicanUsername := ""
 		if s.pelican != nil && credential.Provider == accountdomain.ProviderBuild && input.ForcedProxyUsername == "" && !input.AdminQualityTest {
 			physicalCallCtx = basePhysicalCallCtx
 			if username, poolErr := s.pelican.Select(ctx, credential.ID); poolErr == nil && username != "" {
+				pelicanUsername = username
 				physicalCallCtx = infraegress.WithAccountIdentity(physicalCallCtx, username)
 			}
 		}
@@ -923,7 +963,11 @@ attemptLoop:
 			lease.Release()
 			lastErr = err
 			if neterrorpkg.IsResponseHeaderTimeout(err) && !input.AdminQualityTest {
-				s.rotateResinForSignal(ctx, credential, "response_header_timeout")
+				if input.Streaming && credential.Provider == accountdomain.ProviderBuild && pelicanUsername != "" {
+					s.observePelicanResponseHeader(ctx, credential, pelicanUsername, true)
+				} else {
+					s.rotateResinForSignal(ctx, credential, "response_header_timeout")
+				}
 			}
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
@@ -945,6 +989,9 @@ attemptLoop:
 			continue
 		}
 	handleResponse:
+		if input.Streaming && credential.Provider == accountdomain.ProviderBuild && !input.AdminQualityTest && pelicanUsername != "" {
+			s.observePelicanResponseHeader(ctx, credential, pelicanUsername, false)
+		}
 		if response.ModelCatalogChanged {
 			s.queueAccountModelSync(credential.ID)
 		}
@@ -982,7 +1029,11 @@ attemptLoop:
 					break
 				} else {
 					if neterrorpkg.IsResponseHeaderTimeout(err) && !input.AdminQualityTest {
-						s.rotateResinForSignal(ctx, credential, "response_header_timeout")
+						if input.Streaming && credential.Provider == accountdomain.ProviderBuild && pelicanUsername != "" {
+							s.observePelicanResponseHeader(ctx, credential, pelicanUsername, true)
+						} else {
+							s.rotateResinForSignal(ctx, credential, "response_header_timeout")
+						}
 					}
 					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
 					if !isRetryableTransportFailure(credential.Provider, err) {
@@ -1251,7 +1302,7 @@ attemptLoop:
 					// deliberately does not rotate Resin. Only measured generation
 					// speed and response-header timeout are rotation signals.
 				} else if successful && input.Streaming && !input.AdminQualityTest {
-					s.observeResinTokenSpeed(ctx, credential, record.FirstTokenMS, record.DurationMS, usage.OutputTokens)
+					s.observeResinTokenSpeed(ctx, credential, pelicanUsername, record.FirstTokenMS, record.DurationMS, usage.OutputTokens)
 				} else if successful && !input.Streaming && !input.AdminQualityTest && credential.Provider == accountdomain.ProviderBuild && responseHeaderWait >= resinSlowResponseHeaderThreshold {
 					s.rotateResinForSignal(ctx, credential, "slow_response_headers")
 				}
