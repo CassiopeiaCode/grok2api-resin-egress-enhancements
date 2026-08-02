@@ -50,6 +50,7 @@ var schemaModels = []any{
 	&mediaUploadTicketModel{},
 	&runtimeSettingsModel{},
 	&pelicanEgressEntryModel{},
+	&pelicanBadEgressModel{},
 }
 
 var schemaIndexes = []string{
@@ -97,6 +98,13 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_media_upload_tickets_expires ON media_upload_tickets(expires_at, consumed_at)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_result_asset ON media_jobs(result_asset_id) WHERE result_asset_id <> ''",
 	"CREATE INDEX IF NOT EXISTS idx_pelican_entries_active_due ON pelican_egress_entries(status, next_check_at, id)",
+	"CREATE INDEX IF NOT EXISTS idx_pelican_bad_expires ON pelican_bad_egresses(expires_at, id)",
+	// Blacklist identity is the traced public IP, never the Resin username.
+	// Remove the pre-IP username uniqueness constraint left by the first
+	// migration and collapse any duplicate rows before creating the IP key.
+	"DROP INDEX IF EXISTS idx_pelican_bad_egresses_proxy_username",
+	"DELETE FROM pelican_bad_egresses WHERE id IN (SELECT a.id FROM pelican_bad_egresses a JOIN pelican_bad_egresses b ON a.exit_ip = b.exit_ip WHERE a.exit_ip <> '' AND a.id > b.id)",
+	"CREATE UNIQUE INDEX IF NOT EXISTS idx_pelican_bad_exit_ip_unique ON pelican_bad_egresses(exit_ip) WHERE exit_ip <> ''",
 	// Pending input metadata rows only; keeps startup backfill scans off the full table after migration completes.
 	mediaJobInputMetadataPendingIndex,
 }

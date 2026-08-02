@@ -68,6 +68,7 @@ type accountModel struct {
 type pelicanEgressEntryModel struct {
 	ID            uint64  `gorm:"primaryKey;autoIncrement"`
 	ProxyUsername string  `gorm:"size:128;uniqueIndex;not null;check:chk_pelican_username,length(trim(proxy_username)) BETWEEN 1 AND 128"`
+	ExitIP        string  `gorm:"size:64;index:idx_pelican_exit_ip;not null;default:''"`
 	Label         string  `gorm:"size:16;not null;check:chk_pelican_label,label IN ('good','bad','uncertain')"`
 	Confidence    float64 `gorm:"not null;check:chk_pelican_confidence,confidence >= 0 AND confidence <= 1"`
 	ClassifierVer string  `gorm:"size:128;not null;default:''"`
@@ -79,6 +80,18 @@ type pelicanEgressEntryModel struct {
 }
 
 func (pelicanEgressEntryModel) TableName() string { return "pelican_egress_entries" }
+
+type pelicanBadEgressModel struct {
+	ID            uint64    `gorm:"primaryKey;autoIncrement"`
+	ProxyUsername string    `gorm:"size:128;index;not null"`
+	ExitIP        string    `gorm:"size:64;index:idx_pelican_bad_exit_ip;not null;default:''"`
+	Reason        string    `gorm:"size:128;not null;default:''"`
+	ExpiresAt     time.Time `gorm:"index:idx_pelican_bad_expires;not null"`
+	CreatedAt     time.Time `gorm:"not null"`
+	UpdatedAt     time.Time `gorm:"not null"`
+}
+
+func (pelicanBadEgressModel) TableName() string { return "pelican_bad_egresses" }
 
 func (accountModel) TableName() string { return "provider_accounts" }
 

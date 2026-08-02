@@ -21,6 +21,11 @@ func (f *fakeRepo) RemovePelican(context.Context, string) error { return nil }
 func (f *fakeRepo) TouchPelican(context.Context, string, time.Time, time.Time, string, float64, string) error {
 	return nil
 }
+func (f *fakeRepo) ListBadPelican(context.Context, time.Time) ([]string, error) { return nil, nil }
+func (f *fakeRepo) MarkBadPelican(context.Context, string, string, string, time.Time) error {
+	return nil
+}
+func (f *fakeRepo) ClearBadPelican(context.Context, string, string) error { return nil }
 func TestSelectIsStable(t *testing.T) {
 	f := &fakeRepo{items: []pelican.Entry{{ProxyUsername: "Default.pelican-a", Label: "good"}, {ProxyUsername: "Default.pelican-b", Label: "good"}, {ProxyUsername: "Default.pelican-c", Label: "good"}}}
 	s := NewService(f)

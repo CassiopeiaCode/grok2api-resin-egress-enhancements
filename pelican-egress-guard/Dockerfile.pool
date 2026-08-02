@@ -1,5 +1,5 @@
 FROM python:3.12-alpine
-RUN apk add --no-cache imagemagick rsvg-convert
+RUN apk add --no-cache imagemagick rsvg-convert curl
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY guard.py pelican_pool_guard.py policy.json /app/

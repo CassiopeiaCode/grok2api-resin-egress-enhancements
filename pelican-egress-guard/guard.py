@@ -831,7 +831,11 @@ def build_proxy_url(account: str) -> str:
     host = os.environ.get("GUARD_PROXY_HOST", "resin")
     port = os.environ.get("GUARD_PROXY_PORT", "2260")
     platform = os.environ.get("GUARD_RESIN_PLATFORM", "Default")
-    username = f"{platform}.{account}"
+    account = str(account).strip()
+    # Pool entries may already contain the Resin platform prefix (for
+    # example ``Default.pelican-...``).  Do not turn that into the invalid
+    # ``Default.Default.pelican-...`` username.
+    username = account if account.startswith(platform + ".") else f"{platform}.{account}"
     return f"{scheme}://{urllib.parse.quote(username, safe='.') }:{urllib.parse.quote(token, safe='')}@{host}:{port}"
 
 

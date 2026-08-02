@@ -25,10 +25,15 @@ services:
       TZ: "${TZ:-Asia/Shanghai}"
       GUARD_BASE_URL: http://grok2api:8000
       GUARD_GROK_CONFIG_PATH: /run/grok2api/config.yaml
+      GUARD_RESIN_ENV_PATH: /run/secrets/resin.env
+      GUARD_PROXY_HOST: central-resin
+      GUARD_PROXY_PORT: "2260"
+      GUARD_PROXY_SCHEME: socks5h
       PELICAN_MODEL_PATH: /app/model/pelican-knn-v1.json
       PELICAN_NODE_ID: "${PELICAN_NODE_ID:-33}"
     volumes:
       - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"
+      - "${RESIN_ENV_PATH:-/services/proxies/Resin-Docker/.env}:/run/secrets/resin.env:ro"
     depends_on:
       grok2api:
         condition: service_started

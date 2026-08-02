@@ -25,6 +25,9 @@ func NewService(repo repository.PelicanRepository) *Service {
 func (s *Service) List(ctx context.Context) ([]pelican.Entry, error) {
 	return s.repo.ListActivePelican(ctx)
 }
+func (s *Service) Bad(ctx context.Context) ([]string, error) {
+	return s.repo.ListBadPelican(ctx, time.Now().UTC())
+}
 func (s *Service) Due(ctx context.Context) ([]pelican.Entry, error) {
 	return s.repo.ListDuePelican(ctx, time.Now().UTC())
 }
@@ -51,12 +54,15 @@ func (s *Service) Select(ctx context.Context, accountID uint64) (string, error) 
 	return scores[0].name, nil
 }
 
-func (s *Service) Admit(ctx context.Context, username string, confidence float64, version string) error {
+func (s *Service) Admit(ctx context.Context, username, exitIP string, confidence float64, version string) error {
 	if confidence < .60 {
 		return fmt.Errorf("pelican candidate confidence below admission threshold")
 	}
 	now := time.Now().UTC()
-	_, err := s.repo.UpsertPelican(ctx, pelican.Entry{ProxyUsername: username, Label: "good", Confidence: confidence, ClassifierVer: version, Status: pelican.Active, LastCheckedAt: &now, NextCheckAt: now.Add(s.interval)})
+	if err := s.repo.ClearBadPelican(ctx, username, exitIP); err != nil {
+		return err
+	}
+	_, err := s.repo.UpsertPelican(ctx, pelican.Entry{ProxyUsername: username, ExitIP: exitIP, Label: "good", Confidence: confidence, ClassifierVer: version, Status: pelican.Active, LastCheckedAt: &now, NextCheckAt: now.Add(s.interval)})
 	return err
 }
 func (s *Service) Keep(ctx context.Context, username string, confidence float64, version string) error {
@@ -65,5 +71,8 @@ func (s *Service) Keep(ctx context.Context, username string, confidence float64,
 }
 func (s *Service) Evict(ctx context.Context, username string) error {
 	return s.repo.RemovePelican(ctx, username)
+}
+func (s *Service) MarkBad(ctx context.Context, username, exitIP, reason string) error {
+	return s.repo.MarkBadPelican(ctx, username, exitIP, reason, time.Now().UTC().Add(24*time.Hour))
 }
 func (s *Service) PoolSize(ctx context.Context) (int, error) { v, e := s.List(ctx); return len(v), e }

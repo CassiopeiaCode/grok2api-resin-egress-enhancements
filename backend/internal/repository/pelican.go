@@ -12,4 +12,7 @@ type PelicanRepository interface {
 	UpsertPelican(ctx context.Context, value pelican.Entry) (pelican.Entry, error)
 	RemovePelican(ctx context.Context, username string) error
 	TouchPelican(ctx context.Context, username string, checked, next time.Time, label string, confidence float64, version string) error
+	ListBadPelican(ctx context.Context, now time.Time) ([]string, error)
+	MarkBadPelican(ctx context.Context, username, exitIP, reason string, expires time.Time) error
+	ClearBadPelican(ctx context.Context, username, exitIP string) error
 }

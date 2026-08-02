@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Maintains the fixed-size Build Resin good-username pool."""
 from __future__ import annotations
-import os, random, secrets, time, datetime as dt
+import datetime as dt
+import os
+import random
+import re
+import secrets
+import subprocess
+import time
 from pathlib import Path
-from guard import APIError, GrokClient, KNNClassifier, extract_svg, http_sse, safe_log, now_iso, MODEL
+from guard import APIError, GrokClient, KNNClassifier, build_proxy_url, extract_svg, http_sse, safe_log, MODEL
 
 PROMPT = "画一个鹈鹕骑自行车的svg"
 THRESHOLD = 0.60
@@ -29,6 +35,38 @@ def accounts(client):
 
 def username():
     return "Default.pelican-" + secrets.token_hex(16)
+
+def trace_ip(proxy_username: str) -> str:
+    """Resolve the public IP actually used by this Resin username.
+
+    The blacklist is intentionally based on this value rather than the
+    Resin username: multiple usernames can be assigned to the same egress
+    and must share the same 24-hour quarantine.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "curl", "-fsSL", "--connect-timeout", "10", "--max-time", "20",
+                "--proxy", build_proxy_url(proxy_username),
+                "https://cloudflare.com/cdn-cgi/trace",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=25,
+            check=True,
+            text=True,
+        )
+        match = re.search(r"(?m)^ip=([^\r\n]+)", result.stdout)
+        ip = match.group(1).strip() if match else ""
+        if not ip:
+            safe_log("pelican_trace_missing_ip", username_hash=proxy_username[-12:])
+        return ip
+    except subprocess.CalledProcessError as exc:
+        safe_log("pelican_trace_failed", username_hash=proxy_username[-12:], exit_code=int(exc.returncode))
+        return ""
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        safe_log("pelican_trace_failed", username_hash=proxy_username[-12:], error=type(exc).__name__)
+        return ""
 
 def due(value):
     try:
@@ -69,16 +107,35 @@ def main():
     while True:
         try:
             pool=client.admin_request("GET", "/api/admin/v1/pelican-egress-pool").get("items", [])
+            bad_ips=set(client.admin_request("GET", "/api/admin/v1/pelican-egress-pool/bad").get("items", []))
             due_items=[x for x in pool if due(x.get("next_check_at", x.get("nextCheckAt", x.get("NextCheckAt", ""))))]
             if due_items:
-                item=due_items[0]; name=item.get("proxy_username", item.get("proxyUsername", item.get("ProxyUsername"))); aid=random.choice(accounts(client)).get("id")
-                good,label,conf,_=probe(client,classifier,aid,name)
-                client.admin_request("POST", "/api/admin/v1/pelican-egress-pool/results", {"proxy_username":name,"label":label,"confidence":conf,"classifier_version":"pelican-knn-v1"})
+                item=due_items[0]
+                name=item.get("proxy_username", item.get("proxyUsername", item.get("ProxyUsername")))
+                stored_ip=item.get("exit_ip", item.get("exitIp", item.get("ExitIP", ""))) or ""
+                exit_ip=trace_ip(name) or stored_ip
+                choices=accounts(client)
+                if choices and name:
+                    if exit_ip and exit_ip in bad_ips:
+                        label, conf = "bad", 1.0
+                        safe_log("pelican_active_bad_ip_evicted", exit_ip=exit_ip, username_hash=name[-12:])
+                    else:
+                        aid=random.choice(choices).get("id")
+                        _,label,conf,_=probe(client,classifier,aid,name)
+                    client.admin_request("POST", "/api/admin/v1/pelican-egress-pool/results", {"proxy_username":name,"exit_ip":exit_ip,"label":label,"confidence":conf,"classifier_version":"pelican-knn-v1"})
             elif len(pool)<3:
                 choices=accounts(client)
                 if choices:
-                    aid=random.choice(choices).get("id"); name=username(); good,label,conf,_=probe(client,classifier,aid,name)
-                    if good: client.admin_request("POST", "/api/admin/v1/pelican-egress-pool/results", {"proxy_username":name,"label":"good","confidence":conf,"classifier_version":"pelican-knn-v1"})
+                    aid=random.choice(choices).get("id")
+                    for attempt in range(1,11):
+                        name=username()
+                        exit_ip=trace_ip(name)
+                        if exit_ip and exit_ip in bad_ips and attempt < 10:
+                            safe_log("pelican_bad_ip_skipped", attempt=attempt, exit_ip=exit_ip, username_hash=name[-12:])
+                            continue
+                        _,label,conf,_=probe(client,classifier,aid,name)
+                        client.admin_request("POST", "/api/admin/v1/pelican-egress-pool/results", {"proxy_username":name,"exit_ip":exit_ip,"label":label,"confidence":conf,"classifier_version":"pelican-knn-v1"})
+                        break
             time.sleep(3 if len(pool)<3 else 30)
         except Exception as exc:
             safe_log("pelican_pool_cycle_failed", error=type(exc).__name__); time.sleep(30)

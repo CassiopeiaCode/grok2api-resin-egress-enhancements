@@ -7,6 +7,7 @@ const Active = "active"
 type Entry struct {
 	ID            uint64
 	ProxyUsername string
+	ExitIP        string
 	Label         string
 	Confidence    float64
 	ClassifierVer string
