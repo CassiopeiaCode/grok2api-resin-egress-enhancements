@@ -111,7 +111,7 @@ def probe(client, classifier, account_id, proxy_username):
         return False, "failed", 0.0, {}
 
 def main():
-    client=GrokClient(); client.login(); classifier=KNNClassifier.from_snapshot(Path(os.environ.get("PELICAN_MODEL_PATH", "/app/model/pelican-knn-v1.json")))
+    client=GrokClient(); client.login(); client.ensure_build_account_proxy(NODE_ID); classifier=KNNClassifier.from_snapshot(Path(os.environ.get("PELICAN_MODEL_PATH", "/app/model/pelican-knn-v1.json")))
     while True:
         try:
             pool=client.admin_request("GET", "/api/admin/v1/pelican-egress-pool").get("items", [])

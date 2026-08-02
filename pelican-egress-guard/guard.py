@@ -760,6 +760,30 @@ class GrokClient:
         data = self.admin_request("PUT", f"/api/admin/v1/egress-nodes/{urllib.parse.quote(str(node['id']), safe='')}", body, timeout=30)
         return data if isinstance(data, dict) else node
 
+    def ensure_build_account_proxy(self, node_id: int) -> dict[str, Any]:
+        """Keep the Build Resin node account-bound instead of pinning one lease.
+
+        The Pelican selector supplies a Resin username at request time.  That
+        identity only reaches Resin when the saved proxy URL contains
+        ``{account}``; an old external guard used to save a concrete username.
+        Reconcile the persisted node on every guard start so an operator edit
+        or legacy deployment cannot silently bypass the selector.
+        """
+        for node in self.list_build_nodes():
+            if str(node.get("id")) != str(node_id):
+                continue
+            if bool(node.get("accountBoundProxy")):
+                return node
+            # ``build_proxy_url`` percent-encodes braces as it should for a
+            # concrete URL.  The egress normalizer, however, must receive the
+            # literal marker in order to turn it into its safe sentinel before
+            # parsing and persist it as an account template.
+            template = build_proxy_url("{account}").replace("%7Baccount%7D", "{account}")
+            updated = self.update_build_proxy(node, template)
+            safe_log("build_resin_account_template_restored", node_id=str(node_id))
+            return updated
+        raise GuardError(f"Build egress node {node_id} not found")
+
     def generate(self, prompt: str, timeout: float, stream: bool = True) -> GenerationResult:
         if not self.client_secret:
             self.login()
