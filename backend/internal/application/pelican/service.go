@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/pelican"
@@ -57,6 +58,9 @@ func (s *Service) Select(ctx context.Context, accountID uint64) (string, error) 
 func (s *Service) Admit(ctx context.Context, username, exitIP string, confidence float64, version string) error {
 	if confidence < .60 {
 		return fmt.Errorf("pelican candidate confidence below admission threshold")
+	}
+	if strings.TrimSpace(exitIP) == "" {
+		return fmt.Errorf("pelican candidate exit_ip is required")
 	}
 	now := time.Now().UTC()
 	if err := s.repo.ClearBadPelican(ctx, username, exitIP); err != nil {

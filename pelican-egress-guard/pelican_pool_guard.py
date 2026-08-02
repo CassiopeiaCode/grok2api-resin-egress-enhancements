@@ -129,7 +129,13 @@ def main():
                         safe_log("pelican_active_bad_ip_evicted", exit_ip=exit_ip, username_hash=name[-12:])
                     else:
                         aid=random.choice(choices).get("id")
-                        _,label,conf,_=probe(client,classifier,aid,name)
+                        good,label,conf,_=probe(client,classifier,aid,name)
+                        if good and not exit_ip:
+                            exit_ip=trace_ip(name)
+                        if good and not exit_ip:
+                            safe_log("pelican_good_without_exit_ip", username_hash=name[-12:])
+                            time.sleep(3)
+                            continue
                     client.admin_request("POST", "/api/admin/v1/pelican-egress-pool/results", {"proxy_username":name,"exit_ip":exit_ip,"label":label,"confidence":conf,"classifier_version":"pelican-knn-v1"})
             elif len(pool)<3:
                 choices=accounts(client)
@@ -141,7 +147,15 @@ def main():
                         if exit_ip and exit_ip in bad_ips and attempt < 10:
                             safe_log("pelican_bad_ip_skipped", attempt=attempt, exit_ip=exit_ip, username_hash=name[-12:])
                             continue
-                        _,label,conf,_=probe(client,classifier,aid,name)
+                        good,label,conf,_=probe(client,classifier,aid,name)
+                        if good and not exit_ip:
+                            # A transient trace failure before generation
+                            # must not admit an IP-less good entry. Retry the
+                            # trace after the model request has completed.
+                            exit_ip=trace_ip(name)
+                        if good and not exit_ip:
+                            safe_log("pelican_good_without_exit_ip", username_hash=name[-12:])
+                            continue
                         client.admin_request("POST", "/api/admin/v1/pelican-egress-pool/results", {"proxy_username":name,"exit_ip":exit_ip,"label":label,"confidence":conf,"classifier_version":"pelican-knn-v1"})
                         break
             time.sleep(3 if len(pool)<3 else 30)
