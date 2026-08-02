@@ -12,7 +12,16 @@ NODE_ID = int(os.environ.get("PELICAN_NODE_ID", "33"))
 
 def accounts(client):
     data = client.admin_request("GET", "/api/admin/v1/accounts?page=1&pageSize=500&provider=grok_build&status=active")
-    return [x for x in (data.get("items", []) if isinstance(data, dict) else []) if x.get("enabled", True) and str(x.get("authStatus", x.get("auth_status", "active"))).lower() in {"active", ""}]
+    out=[]
+    for x in (data.get("items", []) if isinstance(data, dict) else []):
+        quota=x.get("quota") or {}
+        cooldown=x.get("cooldownUntil", x.get("cooldown_until"))
+        if not x.get("enabled", True): continue
+        if str(x.get("authStatus", x.get("auth_status", "active"))).lower() not in {"active", ""}: continue
+        if int(x.get("failureCount", x.get("failure_count", 0)) or 0) > 0 or cooldown: continue
+        if quota.get("remaining") is not None and float(quota.get("remaining") or 0) <= 0: continue
+        out.append(x)
+    return out
 
 def username():
     return "Default.pelican-" + secrets.token_hex(16)
