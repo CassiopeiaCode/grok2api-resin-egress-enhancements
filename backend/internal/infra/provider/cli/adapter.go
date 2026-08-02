@@ -123,17 +123,23 @@ func (a *Adapter) UpdateConfig(cfg Config) {
 }
 
 type buildDirectTransport struct {
-	current atomic.Pointer[http.Transport]
+	current      atomic.Pointer[http.Transport]
+	nonStreaming atomic.Pointer[http.Transport]
 }
 
 func newBuildDirectTransport(responseHeaderTimeout time.Duration) *buildDirectTransport {
 	value := &buildDirectTransport{}
 	value.current.Store(newBuildHTTPTransport(responseHeaderTimeout))
+	value.nonStreaming.Store(newBuildHTTPTransport(0))
 	return value
 }
 
 func (t *buildDirectTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	return t.current.Load().RoundTrip(request)
+	transport := t.current.Load()
+	if !infraegress.StreamingFromContext(request.Context()) {
+		transport = t.nonStreaming.Load()
+	}
+	return transport.RoundTrip(request)
 }
 
 func (t *buildDirectTransport) UpdateResponseHeaderTimeout(responseHeaderTimeout time.Duration) {
@@ -455,6 +461,7 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 		bodyReader = bytes.NewReader(body)
 	}
 	requestCtx := infraegress.WithCredential(ctx, request.Credential)
+	requestCtx = infraegress.WithStreaming(requestCtx, request.Streaming)
 	plane := "build"
 	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
 		plane = "xai"

@@ -29,6 +29,24 @@ type Trace struct {
 type traceContextKey struct{}
 type accountContextKey struct{}
 type egressNodeContextKey struct{}
+type streamingContextKey struct{}
+
+// WithStreaming marks a Build transport request so its header deadline can be
+// selected independently from non-streaming requests.
+func WithStreaming(ctx context.Context, streaming bool) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, streamingContextKey{}, streaming)
+}
+
+func StreamingFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value, _ := ctx.Value(streamingContextKey{}).(bool)
+	return value
+}
 
 // WithAccount passes a stable Provider account identity to the egress layer. It is used only to render
 // authentication usernames for sticky proxies such as Resin and is never written to upstream headers or audit.

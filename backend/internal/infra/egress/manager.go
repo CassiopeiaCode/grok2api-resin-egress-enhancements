@@ -315,9 +315,9 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 	// RoundTripper path, so a rotation observed by any channel changes the
 	// sticky proxy identity for all three channels.
 	if forcedIdentity == "" {
-	if suffix := strings.TrimSpace(credential.ResinAccountSuffix); suffix != "" {
-		identity += "_" + suffix
-	}
+		if suffix := strings.TrimSpace(credential.ResinAccountSuffix); suffix != "" {
+			identity += "_" + suffix
+		}
 	}
 	ctx = WithAccountIdentity(ctx, identity)
 	nodeID := credential.EgressNodeID
@@ -1297,7 +1297,7 @@ func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent stri
 }
 
 func newBuildRequestClient(proxyURL string, responseHeaderTimeout time.Duration) (requestClient, error) {
-	return newBuildClient(proxyURL, responseHeaderTimeout)
+	return newBuildClientWithStreamingTimeout(proxyURL, 0, responseHeaderTimeout)
 }
 
 func (m *Manager) cleanupClientCacheLocked(now time.Time) []requestClient {
