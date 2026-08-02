@@ -75,8 +75,16 @@ def due(value):
         return True
 
 def probe(client, classifier, account_id, proxy_username):
+    # Keep the actual Pelican prompt as the final user turn, but prepend one
+    # harmless conversation turn.  This avoids reusing an identical one-turn
+    # conversation while preserving the exact production probe prompt.
+    nonce = secrets.randbelow(1_000_000_000)
     body = {"provider":"grok_build", "account_id":int(account_id), "egress_node_id":NODE_ID, "proxy_username":proxy_username,
-            "request":{"model":MODEL, "stream":True, "messages":[{"role":"user","content":PROMPT}]}}
+            "request":{"model":MODEL, "stream":True, "messages":[
+                {"role":"user", "content":f"请忽略：{nonce}"},
+                {"role":"assistant", "content":"ok"},
+                {"role":"user", "content":PROMPT},
+            ]}}
     started=time.monotonic()
     try:
         envelope=http_sse("POST", "/api/admin/v1/quality-tests/requests", body, token=client.admin_token, timeout=190)
