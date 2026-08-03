@@ -25,7 +25,7 @@ type Service struct {
 
 func NewService(repo repository.PelicanRepository) *Service {
 	return &Service{
-		repo: repo, target: 15, interval: 10 * time.Minute,
+		repo: repo, target: 5, interval: 10 * time.Minute,
 		fastStreaks: make(map[string]int), headerTimeoutStreaks: make(map[string]int),
 	}
 }
@@ -159,7 +159,7 @@ func (s *Service) ResetResponseHeaderTimeout(username string) {
 
 // ObserveResponseHeaderTimeout evicts only while the pool has comfortable
 // spare capacity: strictly more than two thirds of the configured maximum.
-// At target 15 this means 11-15 active leases. Two consecutive timeouts are
+// At target 5 this means 4-5 active leases. Two consecutive timeouts are
 // required for the same username, and callers restrict samples to Build
 // streaming production requests.
 func (s *Service) ObserveResponseHeaderTimeout(ctx context.Context, username string) (bool, int, error) {

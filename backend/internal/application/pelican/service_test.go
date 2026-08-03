@@ -56,7 +56,7 @@ func TestSelectIsStable(t *testing.T) {
 func TestTargetAndConsecutiveFastStreamEviction(t *testing.T) {
 	f := &fakeRepo{items: []pelican.Entry{{ProxyUsername: "Default.pelican-a", ExitIP: "203.0.113.1", Label: "good"}}}
 	s := NewService(f)
-	if s.Target() != 15 {
+	if s.Target() != 5 {
 		t.Fatalf("target=%d", s.Target())
 	}
 	if evicted, streak, err := s.ObserveStreamSpeed(context.Background(), "Default.pelican-a", 250, 200); err != nil || evicted || streak != 1 {
@@ -82,12 +82,12 @@ func TestHeaderTimeoutEvictionRequiresPoolAboveTwoThirds(t *testing.T) {
 		}
 		return out
 	}
-	f := &fakeRepo{items: entries(10)}
+	f := &fakeRepo{items: entries(3)}
 	s := NewService(f)
 	if evicted, streak, err := s.ObserveResponseHeaderTimeout(context.Background(), "Default.pelican-0"); err != nil || evicted || streak != 0 {
-		t.Fatalf("ten-entry pool: evicted=%v streak=%d err=%v", evicted, streak, err)
+		t.Fatalf("three-entry pool: evicted=%v streak=%d err=%v", evicted, streak, err)
 	}
-	f.items = entries(11)
+	f.items = entries(4)
 	if evicted, streak, err := s.ObserveResponseHeaderTimeout(context.Background(), "Default.pelican-0"); err != nil || evicted || streak != 1 {
 		t.Fatalf("first timeout: evicted=%v streak=%d err=%v", evicted, streak, err)
 	}
@@ -96,7 +96,7 @@ func TestHeaderTimeoutEvictionRequiresPoolAboveTwoThirds(t *testing.T) {
 	if evicted, streak, err := s.ObserveResponseHeaderTimeout(context.Background(), "Default.pelican-0"); err != nil || !evicted || streak != 2 {
 		t.Fatalf("second consecutive timeout: evicted=%v streak=%d err=%v", evicted, streak, err)
 	}
-	if len(f.items) != 10 || len(f.badReasons) != 1 || f.badReasons[0] != "consecutive_stream_header_timeouts" {
+	if len(f.items) != 3 || len(f.badReasons) != 1 || f.badReasons[0] != "consecutive_stream_header_timeouts" {
 		t.Fatalf("items=%d bad=%#v", len(f.items), f.badReasons)
 	}
 }

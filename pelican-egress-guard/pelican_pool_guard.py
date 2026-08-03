@@ -13,7 +13,7 @@ from guard import APIError, GrokClient, KNNClassifier, build_proxy_url, extract_
 
 PROMPT = "画一个鹈鹕骑自行车的svg"
 THRESHOLD = 0.55
-POOL_TARGET = int(os.environ.get("PELICAN_POOL_TARGET", "15"))
+POOL_TARGET = int(os.environ.get("PELICAN_POOL_TARGET", "5"))
 NODE_ID = int(os.environ.get("PELICAN_NODE_ID", "33"))
 
 def accounts(client):
