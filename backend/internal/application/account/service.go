@@ -15,6 +15,7 @@ import (
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
@@ -337,6 +338,14 @@ type Service struct {
 	buildBotFlagCache     *resultcache.Cache[string, []uint64]
 	logger                *slog.Logger
 	now                   func() time.Time
+	refreshEgress         refreshEgressSelector
+}
+
+// refreshEgressSelector supplies the stable Pelican/Resin identity used for
+// Build OAuth refresh requests. Keeping this as a small interface avoids a
+// dependency from account lifecycle code on the Pelican application package.
+type refreshEgressSelector interface {
+	Select(context.Context, uint64) (string, error)
 }
 
 func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
@@ -368,6 +377,12 @@ func (s *Service) QuotaRefreshStats() QuotaRefreshStats {
 // SetConcurrencyLimiter 让账号维护任务读取与推理路由相同的活动租约。
 func (s *Service) SetConcurrencyLimiter(value repository.ConcurrencyLimiter) {
 	s.concurrency = value
+}
+
+// SetRefreshEgressSelector makes Build credential refreshes use the same
+// active good Pelican lease pool as normal Build requests.
+func (s *Service) SetRefreshEgressSelector(value refreshEgressSelector) {
+	s.refreshEgress = value
 }
 
 // SetObservedModelStore enables best-effort cross-instance duplicate suppression.
@@ -2115,7 +2130,15 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 		if !ok {
 			return nil, fmt.Errorf("Provider %s 未注册", latest.Provider)
 		}
-		refreshed, err := adapter.RefreshCredential(ctx, latest)
+		refreshCtx := ctx
+		if latest.Provider == accountdomain.ProviderBuild && infraegress.AccountFromContext(ctx) == "" && s.refreshEgress != nil {
+			if username, selectErr := s.refreshEgress.Select(ctx, latest.ID); selectErr != nil {
+				s.logger.Warn("build_refresh_egress_selection_failed", "account_id", latest.ID, "error", selectErr)
+			} else if strings.TrimSpace(username) != "" {
+				refreshCtx = infraegress.WithAccountIdentity(ctx, username)
+			}
+		}
+		refreshed, err := adapter.RefreshCredential(refreshCtx, latest)
 		if err != nil {
 			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialRefreshStateTTL)
 			s.recordCredentialRefreshFailure(persistCtx, latest, err, !options.retryPermanentOnce)
