@@ -18,7 +18,11 @@ POOL_TARGET = int(os.environ.get("PELICAN_POOL_TARGET", "5"))
 NODE_ID = int(os.environ.get("PELICAN_NODE_ID", "33"))
 
 def accounts(client):
-    data = client.admin_request("GET", "/api/admin/v1/accounts?page=1&pageSize=500&provider=grok_build&status=active")
+    # v3.1.1's status=active list filter also applies routing/quota state and
+    # can legitimately return zero even when many enabled credentials are
+    # suitable for an administrator probe. Fetch the provider population and
+    # apply the explicit probe-safe checks below instead.
+    data = client.admin_request("GET", "/api/admin/v1/accounts?page=1&pageSize=500&provider=grok_build")
     out=[]
     for x in (data.get("items", []) if isinstance(data, dict) else []):
         quota=x.get("quota") or {}
