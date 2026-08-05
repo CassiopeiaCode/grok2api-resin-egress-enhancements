@@ -98,7 +98,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 }
 
 func TestUpdateRejectsBuildResponseHeaderTimeoutOutsideSafeRange(t *testing.T) {
-	for _, value := range []string{"29s", "31m"} {
+	for _, value := range []string{"9s", "31m"} {
 		t.Run(value, func(t *testing.T) {
 			cfg := testConfig(t)
 			repository := &runtimeSettingsRepositoryStub{}

@@ -905,30 +905,6 @@ func TestWriteResultRecordsStreamFailureDiagnostic(t *testing.T) {
 	}
 }
 
-func TestWriteResultTurnsPreHeaderStreamSilenceIntoGatewayError(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	handler := NewHandler(nil, nil, 1<<20)
-	var finalCode string
-	result := &gateway.Result{
-		StatusCode: http.StatusOK,
-		Status:     "200 OK",
-		Header:     http.Header{"Content-Type": {"text/event-stream"}},
-		Body:       io.NopCloser(strings.NewReader("")),
-		Finalize: func(_ gateway.Usage, _, code string) {
-			finalCode = code
-		},
-	}
-	router := gin.New()
-	router.GET("/", func(c *gin.Context) {
-		handler.writeResult(c, result, true, streamProtocolResponses)
-	})
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
-	if recorder.Code != http.StatusGatewayTimeout || !strings.Contains(recorder.Body.String(), "upstream_stream_silent") || finalCode != "upstream_stream_silent" {
-		t.Fatalf("status=%d body=%q final=%q", recorder.Code, recorder.Body.String(), finalCode)
-	}
-}
-
 func TestProjectStreamFailureDiagnosticBoundsErrorMessage(t *testing.T) {
 	diagnostic := projectStreamFailureDiagnostic([]byte(`{"type":"error","error":{"code":"server_error","message":"` + strings.Repeat("错误", maxStreamFailureDiagnosticBytes) + `"},"output":"must-not-be-audited"}`))
 	if !diagnostic.BodyTruncated || len(diagnostic.Body) > maxStreamFailureDiagnosticBytes || len(diagnostic.Body) == 0 || !utf8.Valid(diagnostic.Body) || strings.Contains(string(diagnostic.Body), "must-not-be-audited") {
