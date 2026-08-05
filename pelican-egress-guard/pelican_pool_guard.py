@@ -23,20 +23,27 @@ def accounts(client):
     # suitable for an administrator probe. Fetch the provider population and
     # apply the explicit probe-safe checks below instead.
     data = client.admin_request("GET", "/api/admin/v1/accounts?page=1&pageSize=500&provider=grok_build")
-    out=[]
+    strict=[]
+    fallback=[]
     for x in (data.get("items", []) if isinstance(data, dict) else []):
         quota=x.get("quota") or {}
         cooldown=x.get("cooldownUntil", x.get("cooldown_until"))
         if not x.get("enabled", True): continue
         if str(x.get("authStatus", x.get("auth_status", "active"))).lower() not in {"active", ""}: continue
+        fallback.append(x)
         cooling=False
         if cooldown:
             try: cooling=dt.datetime.fromisoformat(str(cooldown).replace("Z","+00:00")).timestamp() > time.time()
             except (TypeError,ValueError,OverflowError): cooling=True
         if int(x.get("failureCount", x.get("failure_count", 0)) or 0) > 0 or cooling: continue
         if quota.get("remaining") is not None and float(quota.get("remaining") or 0) <= 0: continue
-        out.append(x)
-    return out
+        strict.append(x)
+    # Administrator quality requests intentionally bypass production quota
+    # leases and cooldown. Prefer a clean account when one exists, but do not
+    # leave the Resin pool permanently empty when every account has stale
+    # waitingReset/remaining=0 metadata. The real upstream request remains the
+    # authority: unusable fallback accounts simply produce a failed probe.
+    return strict or fallback
 
 def username():
     return "Default.pelican-" + secrets.token_hex(16)
