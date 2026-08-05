@@ -43,6 +43,7 @@ type Service struct {
 	maxTotalBytes int64
 	cleanupAt     int
 	cleanupEvery  time.Duration
+	retention     time.Duration
 	cleanupSignal chan struct{}
 	configChanged chan struct{}
 	totalBytes    atomic.Int64
@@ -54,6 +55,7 @@ type Config struct {
 	MaxTotalBytes           int64
 	CleanupThresholdPercent int
 	CleanupInterval         time.Duration
+	Retention               time.Duration
 }
 
 type ImageStats struct {
@@ -69,6 +71,15 @@ type VideoStats struct {
 	Queued     int64
 }
 
+const defaultMediaRetention = 24 * time.Hour
+
+func normalizedRetention(value time.Duration) time.Duration {
+	if value <= 0 {
+		return defaultMediaRetention
+	}
+	return value
+}
+
 func NewService(assets repository.MediaAssetRepository, jobs repository.MediaJobRepository, objects repository.MediaObjectStorage, cleanupLock repository.DistributedLock, cfg Config) *Service {
 	return NewServiceWithTickets(assets, jobs, nil, objects, cleanupLock, cfg)
 }
@@ -78,7 +89,7 @@ func NewServiceWithTickets(assets repository.MediaAssetRepository, jobs reposito
 	return &Service{
 		assets: assets, jobs: jobs, tickets: tickets, objects: objects, cleanupLock: cleanupLock,
 		publicBaseURL: strings.TrimRight(strings.TrimSpace(cfg.PublicBaseURL), "/"), maxImageBytes: cfg.MaxImageBytes,
-		maxTotalBytes: cfg.MaxTotalBytes, cleanupAt: cfg.CleanupThresholdPercent, cleanupEvery: cfg.CleanupInterval,
+		maxTotalBytes: cfg.MaxTotalBytes, cleanupAt: cfg.CleanupThresholdPercent, cleanupEvery: cfg.CleanupInterval, retention: normalizedRetention(cfg.Retention),
 		cleanupSignal: make(chan struct{}, 1), configChanged: make(chan struct{}, 1),
 	}
 }
@@ -91,6 +102,7 @@ func (s *Service) UpdateConfig(cfg Config) {
 	s.maxTotalBytes = cfg.MaxTotalBytes
 	s.cleanupAt = cfg.CleanupThresholdPercent
 	s.cleanupEvery = cfg.CleanupInterval
+	s.retention = normalizedRetention(cfg.Retention)
 	s.configMu.Unlock()
 	select {
 	case s.configChanged <- struct{}{}:
@@ -421,12 +433,10 @@ func (s *Service) Cleanup(ctx context.Context) (int, error) {
 	}
 	s.totalBytes.Store(total)
 	threshold := cleanupThresholdBytes(cfg)
-	if total <= threshold {
-		return 0, nil
-	}
+	cutoff := time.Now().UTC().Add(-cfg.Retention)
 	deleted := 0
 	offset := 0
-	for total > threshold {
+	for {
 		values, err := s.assets.ListOldestMediaAssets(ctx, offset, cleanupAssetBatchSize)
 		if err != nil {
 			return deleted, err
@@ -439,10 +449,13 @@ func (s *Service) Cleanup(ctx context.Context) (int, error) {
 			return deleted, protErr
 		}
 		deletedInBatch := 0
+		needMore := total > threshold
 		for _, asset := range values {
-			if total <= threshold {
+			expired := asset.CreatedAt.Before(cutoff)
+			if !expired && total <= threshold {
 				break
 			}
+			needMore = needMore || expired
 			if _, skip := protected[asset.ID]; skip {
 				continue
 			}
@@ -458,6 +471,9 @@ func (s *Service) Cleanup(ctx context.Context) (int, error) {
 			total = max(0, total-asset.SizeBytes)
 			deleted++
 			deletedInBatch++
+		}
+		if !needMore {
+			break
 		}
 		if deletedInBatch == 0 {
 			// 本页无可删资产：前进 offset 以越过受保护前缀，避免无限循环。
@@ -481,6 +497,7 @@ func (s *Service) runtimeConfig() Config {
 		PublicBaseURL: s.publicBaseURL,
 		MaxImageBytes: s.maxImageBytes, MaxTotalBytes: s.maxTotalBytes,
 		CleanupThresholdPercent: s.cleanupAt, CleanupInterval: s.cleanupEvery,
+		Retention: s.retention,
 	}
 }
 

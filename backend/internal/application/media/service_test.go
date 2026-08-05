@@ -203,6 +203,59 @@ func TestCleanupDeletesOldestAssetsAtThreshold(t *testing.T) {
 	}
 }
 
+func TestCleanupDeletesExpiredAssetsBelowCapacityThreshold(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "media-retention.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	objects, err := localmedia.NewLocalStore(filepath.Join(t.TempDir(), "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assets := relational.NewMediaAssetRepository(database)
+	raw, _ := base64.StdEncoding.DecodeString(onePixelPNG)
+	now := time.Now().UTC()
+	for _, item := range []struct {
+		id      string
+		created time.Time
+	}{
+		{"img_retention_old_00000001", now.Add(-25 * time.Hour)},
+		{"img_retention_new_00000001", now.Add(-23 * time.Hour)},
+	} {
+		key, saveErr := objects.SaveImage(ctx, item.id, "image/png", raw)
+		if saveErr != nil {
+			t.Fatal(saveErr)
+		}
+		if createErr := assets.CreateMediaAsset(ctx, mediadomain.Asset{
+			ID: item.id, Kind: "image", StorageKey: key, MIMEType: "image/png", SizeBytes: int64(len(raw)),
+			SHA256: strings.Repeat("b", 64), CreatedAt: item.created,
+		}); createErr != nil {
+			t.Fatal(createErr)
+		}
+	}
+	service := NewService(assets, relational.NewMediaJobRepository(database), objects, nil, Config{
+		PublicBaseURL: "https://api.example", MaxImageBytes: 32 << 20, MaxTotalBytes: 1 << 30,
+		CleanupThresholdPercent: 80, CleanupInterval: 10 * time.Minute, Retention: 24 * time.Hour,
+	})
+	deleted, err := service.Cleanup(ctx)
+	if err != nil || deleted != 1 {
+		t.Fatalf("deleted=%d err=%v", deleted, err)
+	}
+	if _, _, err := service.OpenImage(ctx, "img_retention_old_00000001"); !errors.Is(err, ErrAssetNotFound) {
+		t.Fatalf("expired asset error=%v, want not found", err)
+	}
+	if _, body, err := service.OpenImage(ctx, "img_retention_new_00000001"); err != nil {
+		t.Fatalf("fresh asset was deleted: %v", err)
+	} else {
+		_ = body.Close()
+	}
+}
+
 func TestCleanupPagesPastProtectedAssetsAndDeletesLaterUnprotected(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "media-cleanup-protected.db"))

@@ -199,6 +199,7 @@ type MediaConfig struct {
 	MaxTotalBytes           int64            `yaml:"-"`
 	CleanupThresholdPercent int              `yaml:"-"`
 	CleanupInterval         Duration         `yaml:"-"`
+	Retention               Duration         `yaml:"-"`
 	Local                   LocalMediaConfig `yaml:"local"`
 }
 
@@ -509,6 +510,9 @@ func (c Config) Validate() error {
 	if c.Media.CleanupInterval.Value() < time.Minute || c.Media.CleanupInterval.Value() > 24*time.Hour {
 		return errors.New("media.cleanupInterval 必须在 1 分钟到 24 小时之间")
 	}
+	if c.Media.Retention.Value() < time.Hour || c.Media.Retention.Value() > 365*24*time.Hour {
+		return errors.New("media.retention 必须在 1 小时到 365 天之间")
+	}
 	if len(c.Secrets.JWTSecret) < 32 {
 		return errors.New("secrets.jwtSecret 至少需要 32 个字符")
 	}
@@ -799,7 +803,7 @@ func defaultConfig() Config {
 		},
 		Media: MediaConfig{
 			Driver: "local", MaxImageBytes: 32 << 20, MaxTotalBytes: 1 << 30,
-			CleanupThresholdPercent: 80, CleanupInterval: Duration(10 * time.Minute),
+			CleanupThresholdPercent: 80, CleanupInterval: Duration(10 * time.Minute), Retention: Duration(24 * time.Hour),
 			Local: LocalMediaConfig{Path: "./data/media"},
 		},
 		Routing: RoutingConfig{

@@ -177,6 +177,9 @@ export function SettingsPage() {
               <SettingsField controlId="media-cleanup-interval" label={t("settings.media.cleanupInterval")} description={t("settings.media.cleanupIntervalHelp")} error={form.formState.errors.media?.cleanupInterval?.message}>
                 <Controller control={form.control} name="media.cleanupInterval" render={({ field }) => <DurationInput id="media-cleanup-interval" value={field.value} onChange={field.onChange} />} />
               </SettingsField>
+              <SettingsField controlId="media-retention" label={t("settings.media.retention")} description={t("settings.media.retentionHelp")} error={form.formState.errors.media?.retention?.message}>
+                <Controller control={form.control} name="media.retention" render={({ field }) => <DurationInput id="media-retention" value={field.value} onChange={field.onChange} />} />
+              </SettingsField>
               <SettingsField controlId="frontend-public-api-base-url" label={t("settings.media.publicApiBaseURL")} description={t("settings.media.publicApiBaseURLHelp")} error={form.formState.errors.frontend?.publicApiBaseURL?.message} className="sm:col-span-2">
                 <Input id="frontend-public-api-base-url" placeholder="https://api.example.com" {...form.register("frontend.publicApiBaseURL")} />
               </SettingsField>

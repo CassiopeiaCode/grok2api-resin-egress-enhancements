@@ -484,6 +484,7 @@ func mediaConfig(cfg config.Config) mediaapp.Config {
 		PublicBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(),
 		MaxImageBytes: cfg.Media.MaxImageBytes, MaxTotalBytes: cfg.Media.MaxTotalBytes,
 		CleanupThresholdPercent: cfg.Media.CleanupThresholdPercent, CleanupInterval: cfg.Media.CleanupInterval.Value(),
+		Retention: cfg.Media.Retention.Value(),
 	}
 }
 

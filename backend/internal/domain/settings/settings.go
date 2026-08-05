@@ -43,6 +43,7 @@ type MediaConfig struct {
 	MaxTotalBytes           int64
 	CleanupThresholdPercent int
 	CleanupInterval         time.Duration
+	Retention               time.Duration
 }
 
 type ProviderWebConfig struct {
