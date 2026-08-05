@@ -45,6 +45,11 @@ jobs:
           make swagger
           git diff --exit-code -- backend/docs/docs.go backend/docs/swagger.json backend/docs/swagger.yaml
 
+      - name: Test quality guard sidecars
+        run: |
+          (cd pelican-egress-guard && python3 -m unittest -v guard_test.py)
+          python3 -m unittest -v tools/egress-quality-guard/quality_guard_test.py tools/egress-quality-guard/session_rotator_test.py
+
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:

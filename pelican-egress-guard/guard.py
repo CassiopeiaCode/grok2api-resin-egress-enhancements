@@ -278,6 +278,23 @@ def http_sse(method: str, path: str, body: Any | None = None, token: str = "", t
                     text_parts.append(delta)
                     if first_token_at is None:
                         first_token_at = time.monotonic()
+            # The administrator Resin-username endpoint deliberately uses the
+            # production Chat Completions protocol.  Track its choice deltas
+            # with the same clock instead of requiring Responses-style event
+            # names from the upstream node-level Quality Guard endpoint.
+            choices = value.get("choices")
+            if isinstance(choices, list):
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        continue
+                    delta = choice.get("delta")
+                    if not isinstance(delta, dict):
+                        continue
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        text_parts.append(content)
+                        if first_token_at is None:
+                            first_token_at = time.monotonic()
 
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -375,8 +392,18 @@ def extract_usage(value: Any) -> tuple[int, int]:
         if isinstance(item, dict):
             usage = item.get("usage")
             if isinstance(usage, dict):
-                output = _int_value(usage.get("output_tokens") or usage.get("outputTokens"))
-                details = usage.get("output_tokens_details") or usage.get("outputTokensDetails")
+                output = _int_value(
+                    usage.get("output_tokens")
+                    or usage.get("outputTokens")
+                    or usage.get("completion_tokens")
+                    or usage.get("completionTokens")
+                )
+                details = (
+                    usage.get("output_tokens_details")
+                    or usage.get("outputTokensDetails")
+                    or usage.get("completion_tokens_details")
+                    or usage.get("completionTokensDetails")
+                )
                 reasoning = 0
                 if isinstance(details, dict):
                     reasoning = _int_value(details.get("reasoning_tokens") or details.get("reasoningTokens"))
