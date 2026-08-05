@@ -167,6 +167,21 @@ jobs:
           provenance: mode=max
           sbom: true
 
+      - name: Build and publish Resin health pool guard
+        uses: docker/build-push-action@v6
+        with:
+          context: ./pelican-egress-guard
+          file: ./pelican-egress-guard/Dockerfile.pool
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}/resin-health-pool:${{ github.ref_name }}-${{ matrix.arch }}
+            ${{ steps.image.outputs.name }}/resin-health-pool:latest-${{ matrix.arch }}
+          cache-from: type=gha,scope=resin-health-pool-${{ matrix.arch }}
+          cache-to: type=gha,scope=resin-health-pool-${{ matrix.arch }},mode=max
+          provenance: mode=max
+          sbom: true
+
   merge:
     name: Merge image
     if: github.event_name == 'push'
@@ -215,5 +230,23 @@ jobs:
               "${tag}-arm64"
           done
 
+      - name: Create Resin health pool manifest lists
+        shell: bash
+        run: |
+          image="${{ steps.image.outputs.name }}/resin-health-pool"
+          docker buildx imagetools create \
+            -t "$image:${GITHUB_REF_NAME}" \
+            "$image:${GITHUB_REF_NAME}-amd64" \
+            "$image:${GITHUB_REF_NAME}-arm64"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            docker buildx imagetools create \
+              -t "$image:latest" \
+              "$image:latest-amd64" \
+              "$image:latest-arm64"
+          fi
+
       - name: Inspect image
         run: docker buildx imagetools inspect "${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}"
+
+      - name: Inspect Resin health pool image
+        run: docker buildx imagetools inspect "${{ steps.image.outputs.name }}/resin-health-pool:${GITHUB_REF_NAME}"

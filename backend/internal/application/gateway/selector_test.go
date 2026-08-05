@@ -12,6 +12,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
+	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -98,6 +99,96 @@ func TestSelectorPrioritizesDueQuotaProbeOnce(t *testing.T) {
 	selector.MarkSuccess(ctx, probe)
 	if _, err := accounts.GetQuotaRecovery(ctx, probe.ID); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("quota recovery should be cleared, err = %v", err)
+	}
+}
+
+func TestSelectorQualityProbePinsAccountToRequestedEgressNode(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-egress.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	egressNodes := relational.NewEgressRepository(database)
+	firstNode, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "first", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondNode, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "second", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	first, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "first", SourceKey: "first", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1, EgressNodeID: firstNode.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "second", SourceKey: "second", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1, EgressNodeID: secondNode.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	lease, err := selector.AcquireForKeyOnEgressNode(ctx, account.ProviderBuild, 0, "grok-test", "", "", nil, false, clientkeydomain.AccountScope{}, secondNode.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != second.ID || lease.Credential.ID == first.ID {
+		t.Fatalf("selected account=%d, want=%d on node=%d", lease.Credential.ID, second.ID, secondNode.ID)
+	}
+}
+
+func TestSelectorQualityProbeBorrowsHealthyAccountForUnavailableNode(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-egress-fallback.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	egressNodes := relational.NewEgressRepository(database)
+	targetNode, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "target", Scope: egressdomain.ScopeBuild, Enabled: false, EncryptedProxyURL: "target"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthyNode, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "healthy", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "healthy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	_, _, err = accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "target-reauth", SourceKey: "target-reauth", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusReauthRequired, MaxConcurrent: 1, EgressNodeID: targetNode.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "healthy", SourceKey: "healthy", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1, EgressNodeID: healthyNode.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	lease, err := selector.AcquireForKeyOnEgressNode(ctx, account.ProviderBuild, 0, "grok-test", "", "ordinary-affinity", nil, false, clientkeydomain.AccountScope{}, targetNode.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != healthy.ID {
+		t.Fatalf("selected account=%d, want borrowed healthy account=%d", lease.Credential.ID, healthy.ID)
 	}
 }
 
@@ -690,6 +781,94 @@ func TestSelectorUsesBatchConcurrencySnapshot(t *testing.T) {
 	}
 }
 
+func TestCandidatePlanExcludesSaturatedAccounts(t *testing.T) {
+	limiter := &batchConcurrencyLimiter{values: map[string]int{"account:1": 1, "account:2": 0}}
+	selector := &Selector{concurrency: limiter, lastSelectedAt: make(map[uint64]time.Time)}
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 1, Priority: 100, MaxConcurrent: 1}},
+		{Credential: account.Credential{ID: 2, Priority: 1, MaxConcurrent: 1}},
+	}
+	plan, err := selector.planCandidates(context.Background(), values, time.Now().UTC(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := plan.Next()
+	if !ok || first.Credential.ID != 2 {
+		t.Fatalf("first candidate = %#v, want account 2", first)
+	}
+	if _, ok := plan.Next(); ok {
+		t.Fatal("saturated account should not remain in the plan")
+	}
+}
+
+func TestSelectionSessionReusesCandidatePlanAcrossAccountSwitches(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selection-session.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	first, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "first", SourceKey: "first", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 20, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "second", SourceKey: "second", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limiter := &batchConcurrencyLimiter{values: map[string]int{}}
+	selector := NewSelector(accounts, limiter, memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	excluded := map[uint64]bool{}
+	session, err := selector.beginSelectionSession(ctx, account.ProviderBuild, 0, "model", "", "", excluded, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := session.Acquire(ctx, excluded, false)
+	if err != nil || lease == nil || lease.Credential.ID != first.ID {
+		t.Fatalf("first lease = %#v, err = %v", lease, err)
+	}
+	lease.Release()
+	session.RetryAccount(first.ID)
+	first.Enabled = false
+	if _, err := accounts.Update(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	// Session 快照中的 first 已过期，Acquire 应跳过它并继续使用现有计划。
+	lease, err = session.Acquire(ctx, excluded, false)
+	if err != nil || lease == nil || lease.Credential.ID != second.ID {
+		t.Fatalf("second lease = %#v, err = %v", lease, err)
+	}
+	lease.Release()
+	if limiter.batchCalls != 1 {
+		t.Fatalf("batch concurrency reads = %d, want 1", limiter.batchCalls)
+	}
+}
+
+func TestSelectorEvictsOnlyChangedCandidate(t *testing.T) {
+	key := candidateCacheKey{provider: account.ProviderBuild, upstreamModel: "model"}
+	selector := &Selector{candidates: map[candidateCacheKey]candidateSnapshot{
+		key: {values: []account.RoutingCandidate{
+			{Credential: account.Credential{ID: 1, Provider: account.ProviderBuild}},
+			{Credential: account.Credential{ID: 2, Provider: account.ProviderBuild}},
+		}},
+	}}
+	selector.evictCandidate(account.ProviderBuild, 1)
+	values := selector.candidates[key].values
+	if len(values) != 1 || values[0].Credential.ID != 2 {
+		t.Fatalf("remaining candidates = %#v", values)
+	}
+}
+
 func TestSelectorPreferFreeBuildHotReloadAndSaturationFallback(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "free-first.db"))
@@ -796,31 +975,6 @@ func TestCandidatePlanPreservesSelectorOrdering(t *testing.T) {
 	}
 }
 
-func TestBuildCandidatePlanPrefersLeastRecentlyUsedIdleAccount(t *testing.T) {
-	now := time.Now().UTC()
-	limiter := &batchConcurrencyLimiter{values: map[string]int{"account:3": 1}}
-	selector := &Selector{
-		concurrency:    limiter,
-		lastSelectedAt: map[uint64]time.Time{1: now.Add(-3 * time.Minute), 2: now.Add(-time.Minute), 3: now.Add(-10 * time.Second)},
-	}
-	values := []account.RoutingCandidate{
-		{Credential: account.Credential{ID: 1, Provider: account.ProviderBuild}},
-		{Credential: account.Credential{ID: 2, Provider: account.ProviderBuild}},
-		{Credential: account.Credential{ID: 3, Provider: account.ProviderBuild}},
-	}
-	plan, err := selector.planCandidates(context.Background(), values, now, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ordered := make([]uint64, 0, len(values))
-	for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
-		ordered = append(ordered, candidate.Credential.ID)
-	}
-	if expected := []uint64{1, 2, 3}; !slices.Equal(ordered, expected) {
-		t.Fatalf("Build 候选顺序 = %v, want %v", ordered, expected)
-	}
-}
-
 func TestSelectorConsumesOnlyMatchingQuotaSnapshot(t *testing.T) {
 	key := candidateCacheKey{provider: account.ProviderWeb, upstreamModel: "chat", quotaMode: "fast"}
 	values := []account.RoutingCandidate{{
@@ -829,12 +983,20 @@ func TestSelectorConsumesOnlyMatchingQuotaSnapshot(t *testing.T) {
 	selector := &Selector{candidates: map[candidateCacheKey]candidateSnapshot{key: newCandidateSnapshot(values, time.Now().UTC().Add(time.Minute))}}
 	original := selector.candidates[key].values
 	selector.ConsumeQuota(account.ProviderWeb, 7, "fast", 3)
-	window := selector.candidates[key].values[0].QuotaWindow
-	if window == nil || window.Remaining != 7 {
-		t.Fatalf("quota window = %#v", window)
-	}
 	if original[0].QuotaWindow == nil || original[0].QuotaWindow.Remaining != 10 {
 		t.Fatalf("published snapshot was mutated: %#v", original[0].QuotaWindow)
+	}
+	consumed := selector.quotaConsumptionSnapshot(account.ProviderWeb)
+	if quotaWindowExhausted(values[0], consumed) {
+		t.Fatal("partially consumed quota was treated as exhausted")
+	}
+	selector.ConsumeQuota(account.ProviderWeb, 7, "other", 100)
+	if quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb)) {
+		t.Fatal("a different quota mode affected the candidate")
+	}
+	selector.ConsumeQuota(account.ProviderWeb, 7, "fast", 7)
+	if !quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb)) {
+		t.Fatal("fully consumed quota remained schedulable")
 	}
 }
 
@@ -918,6 +1080,75 @@ func TestSelectorStickySessionWaitsForBoundAccountCapacity(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("sticky request did not wake after bound capacity returned")
 	}
+}
+
+func TestSelectionSessionStickyWaitsForBoundAccountCapacity(t *testing.T) {
+	ctx := context.Background()
+	sticky := memory.NewStickyStore()
+	selector, primary, _ := newStickySelectorFixture(t, sticky, 300*time.Millisecond, true)
+	firstSession, err := selector.beginSelectionSession(ctx, account.ProviderBuild, 0, "model", "", "stable-affinity", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := firstSession.Acquire(ctx, nil, false)
+	if err != nil || first.Credential.ID != primary.ID {
+		t.Fatalf("first lease = %#v, err = %v", first, err)
+	}
+	secondSession, err := selector.beginSelectionSession(ctx, account.ProviderBuild, 0, "model", "", "stable-affinity", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		lease *accountLease
+		err   error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		lease, acquireErr := secondSession.Acquire(ctx, nil, false)
+		resultCh <- result{lease: lease, err: acquireErr}
+	}()
+	select {
+	case value := <-resultCh:
+		t.Fatalf("selection session bypassed the sticky account before capacity returned: %#v", value)
+	case <-time.After(30 * time.Millisecond):
+	}
+	first.Release()
+	select {
+	case value := <-resultCh:
+		if value.err != nil || value.lease == nil || value.lease.Credential.ID != primary.ID {
+			t.Fatalf("sticky lease = %#v, err = %v", value.lease, value.err)
+		}
+		value.lease.Release()
+	case <-time.After(time.Second):
+		t.Fatal("selection session did not wake after sticky capacity returned")
+	}
+}
+
+func TestSelectionSessionStickyFallbackDoesNotRebind(t *testing.T) {
+	ctx := context.Background()
+	sticky := memory.NewStickyStore()
+	selector, primary, fallback := newStickySelectorFixture(t, sticky, 20*time.Millisecond, true)
+	firstSession, err := selector.beginSelectionSession(ctx, account.ProviderBuild, 0, "model", "", "stable-affinity", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := firstSession.Acquire(ctx, nil, false)
+	if err != nil || first.Credential.ID != primary.ID {
+		t.Fatalf("first lease = %#v, err = %v", first, err)
+	}
+	secondSession, err := selector.beginSelectionSession(ctx, account.ProviderBuild, 0, "model", "", "stable-affinity", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary, err := secondSession.Acquire(ctx, nil, false)
+	if err != nil || temporary.Credential.ID != fallback.ID {
+		t.Fatalf("temporary lease = %#v, err = %v", temporary, err)
+	}
+	if boundID, ok, err := sticky.Get(ctx, stickySessionKey("stable-affinity"), time.Now().UTC()); err != nil || !ok || boundID != primary.ID {
+		t.Fatalf("sticky binding changed after temporary fallback: id=%d ok=%v err=%v", boundID, ok, err)
+	}
+	temporary.Release()
+	first.Release()
 }
 
 func TestSelectorStickySessionTemporaryFallbackDoesNotRebind(t *testing.T) {
@@ -1061,6 +1292,55 @@ func (s *recordingStickyStore) Expiries() []time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]time.Time(nil), s.expiries...)
+}
+
+func TestMarkFailureSoftNetworkCooldown(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "soft-network.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "soft", SourceKey: "soft", EncryptedAccessToken: "encrypted", Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 500*time.Millisecond)
+	before := time.Now().UTC()
+	selector.MarkFailure(ctx, credential, 0, 0)
+	updated, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.FailureCount != 0 {
+		t.Fatalf("soft network failure count = %d, want 0", updated.FailureCount)
+	}
+	if updated.CooldownUntil == nil {
+		t.Fatal("expected short cooldown")
+	}
+	cooldown := updated.CooldownUntil.Sub(before)
+	if cooldown < 4*time.Second || cooldown > 6*time.Second {
+		t.Fatalf("soft network cooldown = %s, want ~5s", cooldown)
+	}
+
+	selector.MarkFailure(ctx, updated, http.StatusTooManyRequests, 0)
+	hard, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hard.FailureCount != 1 {
+		t.Fatalf("hard failure count = %d, want 1", hard.FailureCount)
+	}
+	if hard.CooldownUntil == nil || hard.CooldownUntil.Sub(time.Now().UTC()) < 20*time.Second {
+		t.Fatalf("hard cooldown too short: %v", hard.CooldownUntil)
+	}
 }
 
 type batchConcurrencyLimiter struct {

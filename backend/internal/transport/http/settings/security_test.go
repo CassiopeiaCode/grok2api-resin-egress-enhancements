@@ -47,9 +47,9 @@ func TestSettingsResponseIncludesBuildTokenAuth(t *testing.T) {
 
 func TestSettingsResponseIncludesRecommendedBuildBaseline(t *testing.T) {
 	response := newSettingsResponse(settingsapp.Snapshot{RecommendedProviderBuild: settingsapp.ProviderBuildRecommendation{
-		ClientVersion: "0.2.111", UserAgent: "grok-shell/0.2.111 (linux; x86_64)",
+		ClientVersion: "0.2.119", UserAgent: "grok-shell/0.2.119 (linux; x86_64)",
 	}})
-	if response.RecommendedProviderBuild.ClientVersion != "0.2.111" || response.RecommendedProviderBuild.UserAgent == "" {
+	if response.RecommendedProviderBuild.ClientVersion != "0.2.119" || response.RecommendedProviderBuild.UserAgent == "" {
 		t.Fatalf("recommended build = %#v", response.RecommendedProviderBuild)
 	}
 }
@@ -60,6 +60,52 @@ func TestSettingsResponseIncludesPreferFreeBuild(t *testing.T) {
 	}})
 	if !response.Config.Routing.PreferFreeBuild {
 		t.Fatal("preferFreeBuild was lost from settings response")
+	}
+}
+
+func TestSettingsResponseIncludesMarkBuildChatDeniedAsReauth(t *testing.T) {
+	response := newSettingsResponse(settingsapp.Snapshot{Config: settingsapp.EditableConfig{
+		Routing: settingsapp.RoutingConfig{MarkBuildChatDeniedAsReauth: true},
+	}})
+	if response.Config.Routing.MarkBuildChatDeniedAsReauth == nil || !*response.Config.Routing.MarkBuildChatDeniedAsReauth {
+		t.Fatal("markBuildChatDeniedAsReauth was lost from settings response")
+	}
+}
+
+func TestLegacySettingsRequestMayOmitMarkBuildChatDeniedAsReauth(t *testing.T) {
+	var dto settingsConfigDTO
+	if err := json.Unmarshal([]byte(`{"routing":{"stickyTTL":"1h"}}`), &dto); err != nil {
+		t.Fatal(err)
+	}
+	input := dto.toApplication()
+	if input.Routing.MarkBuildChatDeniedAsReauthProvided {
+		t.Fatal("missing markBuildChatDeniedAsReauth was treated as an explicit update")
+	}
+}
+
+func TestAccountIsolationSettingsPresenceIsPreserved(t *testing.T) {
+	response := newSettingsResponse(settingsapp.Snapshot{Config: settingsapp.EditableConfig{
+		Routing: settingsapp.RoutingConfig{AccountIsolatedConnections: true},
+	}})
+	if response.Config.Routing.AccountIsolatedConnections == nil || !*response.Config.Routing.AccountIsolatedConnections {
+		t.Fatal("accountIsolatedConnections was lost from settings response")
+	}
+
+	var legacy settingsConfigDTO
+	if err := json.Unmarshal([]byte(`{"routing":{"stickyTTL":"1h"}}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.toApplication().Routing.AccountIsolatedConnectionsProvided {
+		t.Fatal("missing accountIsolatedConnections was treated as an explicit update")
+	}
+
+	var explicit settingsConfigDTO
+	if err := json.Unmarshal([]byte(`{"routing":{"accountIsolatedConnections":false}}`), &explicit); err != nil {
+		t.Fatal(err)
+	}
+	input := explicit.toApplication()
+	if !input.Routing.AccountIsolatedConnectionsProvided || input.Routing.AccountIsolatedConnections {
+		t.Fatalf("explicit false account isolation setting was lost: %#v", input.Routing)
 	}
 }
 

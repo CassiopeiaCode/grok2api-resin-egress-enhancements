@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chenyme/grok2api/backend/internal/application/gateway"
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
+	"github.com/chenyme/grok2api/backend/internal/application/gateway"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/inference"
@@ -20,21 +20,21 @@ import (
 // request body is deliberately passed through unchanged; no test prompt is
 // injected by this endpoint.
 type Handler struct {
-	gateway   *gateway.Service
-	inference *inference.Handler
+	gateway    *gateway.Service
+	inference  *inference.Handler
 	clientKeys *clientkeyapp.Service
 }
 
 type requestEnvelope struct {
-	Provider        string          `json:"provider"`
-	AccountID       uint64          `json:"account_id"`
-	EgressNodeID    uint64          `json:"egress_node_id"`
-	ProxyUsername   string          `json:"proxy_username"`
-	Operation       string          `json:"operation"`
-	Model           string          `json:"model"`
-	Stream          *bool           `json:"stream"`
-	Request         json.RawMessage `json:"request"`
-	Body            json.RawMessage `json:"body"`
+	Provider      string          `json:"provider"`
+	AccountID     uint64          `json:"account_id"`
+	EgressNodeID  uint64          `json:"egress_node_id"`
+	ProxyUsername string          `json:"proxy_username"`
+	Operation     string          `json:"operation"`
+	Model         string          `json:"model"`
+	Stream        *bool           `json:"stream"`
+	Request       json.RawMessage `json:"request"`
+	Body          json.RawMessage `json:"body"`
 }
 
 type requestMeta struct {

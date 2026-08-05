@@ -35,6 +35,10 @@ Thumbs.db
 *.coverprofile
 *.test
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Frontend
 /.pnpm-store/
 /frontend/.pnpm-store/
@@ -48,3 +52,4 @@ Thumbs.db
 /.tmp/
 /tmp/
 /Dockerfile.prebuilt
+/Dockerfile.local

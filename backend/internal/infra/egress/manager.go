@@ -51,11 +51,15 @@ const egressIPv6ProbeEndpoint = "https://v6.ipinfo.io/json"
 const cloudflareIPv4ProbeEndpoint = "https://1.1.1.1/cdn-cgi/trace"
 const cloudflareIPv6ProbeEndpoint = "https://[2606:4700:4700::1111]/cdn-cgi/trace"
 const egressProbeTimeout = 15 * time.Second
+const failureProbeCompletionGrace = 5 * time.Second
+const failureProbeTimeout = 20 * time.Second
+const failureProbeWaitTimeout = 5 * time.Second
 const clientCreationRetryLimit = 3
 const maxClientVersionEntries = 4096
 
 var errNodeSnapshotInvalidated = errors.New("egress node snapshot invalidated")
 var errClientCacheInvalidated = errors.New("egress client cache invalidated")
+var errAccountConnectionIsolationDisabled = errors.New("egress account connection isolation disabled")
 
 type Lease struct {
 	NodeID           uint64
@@ -77,6 +81,14 @@ type Lease struct {
 type requestClient interface {
 	Do(*http.Request) (*http.Response, error)
 	CloseIdleConnections()
+}
+
+type FailureProber func(context.Context, uint64) (domain.ProbeResult, error)
+
+type failureProbeState struct {
+	running       bool
+	lastCompleted time.Time
+	done          chan struct{}
 }
 
 func (l *Lease) Do(request *http.Request) (*http.Response, error) {
@@ -142,9 +154,13 @@ type Manager struct {
 	clientVersions       map[uint64]uint64
 	clientGeneration     uint64
 	buildHeaderTimeout   atomic.Int64
+	accountIsolated      atomic.Bool
 	operationsConfig     cachedOperationsConfig
 	operationsConfigLoad singleflight.Group
 	operationsConfigVer  uint64
+	failureProbeMu       sync.Mutex
+	failureProber        FailureProber
+	failureProbes        map[uint64]failureProbeState
 	lastClientCleanup    time.Time
 	clearanceLoads       singleflight.Group
 	clearanceConfig      ClearanceConfig
@@ -154,6 +170,7 @@ type Manager struct {
 	solver               clearanceSolver
 	clearanceLock        repository.DistributedLock
 	newBuildClient       func(string, time.Duration) (requestClient, error)
+	newBuildEnvClient    func(time.Duration) (requestClient, error)
 	newBrowserClient     func(string, string) (*browserClient, error)
 }
 
@@ -189,9 +206,10 @@ type cachedClient struct {
 }
 
 type clientCacheKey struct {
-	nodeID      uint64
-	scope       domain.Scope
-	fingerprint string
+	nodeID          uint64
+	scope           domain.Scope
+	fingerprint     string
+	accountIdentity string
 }
 
 type cachedNodeSnapshot struct {
@@ -210,7 +228,8 @@ func NewManager(repository repository.EgressRepository, cipher *security.Cipher)
 		clients: make(map[clientCacheKey]cachedClient),
 		nodes:   make(map[domain.Scope]cachedNodeSnapshot), healthyNodes: make(map[uint64]time.Time),
 		nodeVersions: make(map[domain.Scope]uint64), clientVersions: make(map[uint64]uint64), clearances: make(map[string]clearanceState),
-		newBuildClient: newBuildRequestClient, newBrowserClient: newBrowserClient,
+		failureProbes:  make(map[uint64]failureProbeState),
+		newBuildClient: newBuildRequestClient, newBuildEnvClient: newBuildEnvironmentRequestClient, newBrowserClient: newBrowserClient,
 		solver:          flaresolverrSolver{},
 		clearanceConfig: ClearanceConfig{Mode: "manual", TargetURL: "https://grok.com", Timeout: time.Minute, RefreshInterval: 10 * time.Minute},
 	}
@@ -232,6 +251,85 @@ func (m *Manager) log() *slog.Logger {
 	return m.logger
 }
 
+// SetFailureProber enables an immediate, deduplicated connectivity probe after
+// a fixed proxy reports a transport failure. The callback persists the probe
+// result; it must not depend on the failed request context.
+func (m *Manager) SetFailureProber(value FailureProber) {
+	m.failureProbeMu.Lock()
+	m.failureProber = value
+	if value == nil {
+		clear(m.failureProbes)
+	}
+	m.failureProbeMu.Unlock()
+}
+
+func (m *Manager) scheduleFailureProbe(node domain.Node) {
+	m.failureProbeMu.Lock()
+	prober := m.failureProber
+	state := m.failureProbes[node.ID]
+	if prober == nil || state.running {
+		m.failureProbeMu.Unlock()
+		return
+	}
+	state.running = true
+	state.done = make(chan struct{})
+	m.failureProbes[node.ID] = state
+	done := state.done
+	m.failureProbeMu.Unlock()
+
+	m.log().Info("egress_failure_probe_scheduled", "node_id", node.ID, "node_name", node.Name, "scope", node.Scope)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), failureProbeTimeout)
+		result, err := prober(ctx, node.ID)
+		cancel()
+
+		m.failureProbeMu.Lock()
+		state := m.failureProbes[node.ID]
+		if state.done == done {
+			state.running = false
+			state.lastCompleted = time.Now().UTC()
+			m.failureProbes[node.ID] = state
+		}
+		close(done)
+		m.failureProbeMu.Unlock()
+
+		if err != nil {
+			m.log().Warn("egress_failure_probe_failed", "node_id", node.ID, "node_name", node.Name, "scope", node.Scope, "error", err)
+			return
+		}
+		if result.Status == domain.ProbeStatusHealthy {
+			m.invalidateNodes(node.Scope)
+		}
+		m.log().Info("egress_failure_probe_completed", "node_id", node.ID, "node_name", node.Name, "scope", node.Scope, "probe_status", result.Status, "latency_ms", result.LatencyMS)
+	}()
+}
+
+func (m *Manager) waitForFailureProbe(ctx context.Context, nodeID uint64) (bool, error) {
+	now := time.Now().UTC()
+	m.failureProbeMu.Lock()
+	state, exists := m.failureProbes[nodeID]
+	m.failureProbeMu.Unlock()
+	if !exists {
+		return false, nil
+	}
+	if !state.running {
+		return !state.lastCompleted.IsZero() && now.Sub(state.lastCompleted) < failureProbeCompletionGrace, nil
+	}
+	if state.done == nil {
+		return false, nil
+	}
+	timer := time.NewTimer(failureProbeWaitTimeout)
+	defer timer.Stop()
+	select {
+	case <-state.done:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-timer.C:
+		return false, nil
+	}
+}
+
 // UpdateBuildResponseHeaderTimeout rebuilds only cached Build clients. Active
 // requests keep their current transport and are not interrupted.
 func (m *Manager) UpdateBuildResponseHeaderTimeout(value time.Duration) {
@@ -250,6 +348,47 @@ func (m *Manager) UpdateBuildResponseHeaderTimeout(value time.Duration) {
 	}
 	m.clientMu.Unlock()
 	closeRequestClients(stale)
+}
+
+// UpdateAccountIsolatedConnections toggles per-account upstream connection pools.
+// When enabled, different accounts do not share TCP/HTTP clients so upstream
+// egress load balancers can spread traffic by connection; the same account still
+// reuses its own pool. Changing the setting rebuilds cached clients without
+// interrupting in-flight requests.
+func (m *Manager) UpdateAccountIsolatedConnections(enabled bool) {
+	m.clientMu.Lock()
+	if m.accountIsolated.Load() == enabled {
+		m.clientMu.Unlock()
+		return
+	}
+	// Change the mode while holding the same lock used to validate client-cache
+	// keys. This makes the mode snapshot and cache invalidation one transition.
+	m.accountIsolated.Store(enabled)
+	stale := make([]requestClient, 0, len(m.clients))
+	for key, cached := range m.clients {
+		stale = append(stale, m.evictClientLocked(key, cached))
+	}
+	m.invalidateAllClientVersionsLocked()
+	m.clientMu.Unlock()
+	closeRequestClients(stale)
+	m.log().Info("egress_account_connection_isolation_updated", "enabled", enabled, "evicted_clients", len(stale))
+}
+
+// AccountIsolatedConnections reports whether upstream clients are partitioned by account.
+func (m *Manager) AccountIsolatedConnections() bool {
+	return m != nil && m.accountIsolated.Load()
+}
+
+func isolationAccountIdentity(ctx context.Context, scope domain.Scope, affinity string) string {
+	identity := accountFromContext(ctx)
+	if identity != "" {
+		return identity
+	}
+	affinity = strings.TrimSpace(affinity)
+	if affinity != "" {
+		return string(scope) + "_" + affinity
+	}
+	return "shared"
 }
 
 // SetClearanceLock enables cross-instance coordination for shared, fixed egress
@@ -281,6 +420,22 @@ func (m *Manager) UpdateClearanceConfig(value ClearanceConfig) {
 func (m *Manager) Acquire(ctx context.Context, scope domain.Scope, affinity string) (*Lease, error) {
 	lease, _, err := m.acquire(ctx, scope, affinity, true, "", egressNodeFromContext(ctx))
 	return lease, err
+}
+
+// AcquireBuildEnvironmentDirectIfIsolated creates an account-partitioned direct
+// Build lease while preserving the legacy direct transport's environment-proxy
+// semantics. The bool is false when isolation was disabled before the lease was
+// acquired, allowing the caller to retain its original fallback transport.
+func (m *Manager) AcquireBuildEnvironmentDirectIfIsolated(ctx context.Context, affinity string) (*Lease, bool, error) {
+	selected := domain.Node{ID: 0, Name: "direct", Scope: domain.ScopeBuild, Enabled: true, Health: 1}
+	lease, _, err := m.leaseForNodeWithOptions(ctx, domain.ScopeBuild, affinity, "", false, selected, clientOptions{
+		buildEnvironmentProxy:   true,
+		requireAccountIsolation: true,
+	})
+	if errors.Is(err, errAccountConnectionIsolationDisabled) {
+		return nil, false, nil
+	}
+	return lease, err == nil, err
 }
 
 // AcquireCredential binds the outbound proxy identity to one persisted
@@ -664,35 +819,50 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	configured := false
 	var available []domain.Node
 	if boundNodeID != 0 {
-		selected, err := m.repository.GetEgressNode(ctx, boundNodeID)
-		if err != nil {
-			primaryErr := fmt.Errorf("读取绑定出口节点: %w", err)
-			if !errors.Is(err, repository.ErrNotFound) {
-				return nil, true, primaryErr
+		waitedForProbe := false
+		qualityProbe := qualityProbeFromContext(ctx)
+		for {
+			now = time.Now().UTC()
+			selected, err := m.repository.GetEgressNode(ctx, boundNodeID)
+			if err != nil {
+				primaryErr := fmt.Errorf("读取绑定出口节点: %w", err)
+				if !errors.Is(err, repository.ErrNotFound) {
+					return nil, true, primaryErr
+				}
+				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, primaryErr)
 			}
-			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, primaryErr)
+			if !domain.SupportsScope(selected.Scope, scope) {
+				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 与 %s 作用域不兼容", boundNodeID, scope))
+			}
+			if !selected.Enabled && !qualityProbe {
+				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 已禁用", boundNodeID))
+			}
+			if strings.TrimSpace(selected.EncryptedProxyURL) == "" {
+				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 未配置代理地址", boundNodeID))
+			}
+			proxyPool := m.isProxyPoolNode(selected)
+			if !qualityProbe && !proxyPool && selected.CooldownUntil != nil && now.Before(*selected.CooldownUntil) {
+				if !waitedForProbe && selected.LastError == domain.LastErrorTransport {
+					completed, waitErr := m.waitForFailureProbe(ctx, boundNodeID)
+					if waitErr != nil {
+						return nil, true, waitErr
+					}
+					if completed {
+						waitedForProbe = true
+						continue
+					}
+				}
+				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 正在冷却", boundNodeID))
+			}
+			return m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected)
 		}
-		if !domain.SupportsScope(selected.Scope, scope) {
-			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 与 %s 作用域不兼容", boundNodeID, scope))
-		}
-		if !selected.Enabled {
-			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 已禁用", boundNodeID))
-		}
-		if strings.TrimSpace(selected.EncryptedProxyURL) == "" {
-			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 未配置代理地址", boundNodeID))
-		}
-		proxyPool := m.isProxyPoolNode(selected)
-		if !proxyPool && selected.CooldownUntil != nil && now.Before(*selected.CooldownUntil) {
-			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 正在冷却", boundNodeID))
-		}
-		return m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected)
 	}
 	fallbackConfig, fallbackSupported, fallbackConfigErr := m.loadOperationsConfig(ctx, now)
 	fallback := domain.FallbackConfig{Mode: domain.FallbackModeNone}
-	reservedFallbackNodes := make(map[uint64]struct{}, 4)
+	reservedFallbackNodes := make(map[uint64]struct{}, len(allEgressScopes()))
 	if fallbackConfigErr == nil && fallbackSupported {
 		fallback = fallbackConfig.FallbackFor(scope)
-		for _, fallbackScope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+		for _, fallbackScope := range allEgressScopes() {
 			configuredFallback := fallbackConfig.FallbackFor(fallbackScope)
 			if configuredFallback.Mode == domain.FallbackModeFixed && configuredFallback.NodeID != 0 {
 				reservedFallbackNodes[configuredFallback.NodeID] = struct{}{}
@@ -902,9 +1072,18 @@ func fallbackError(primaryErr, fallbackErr error) error {
 	return fmt.Errorf("%w；出口回退不可用: %v", primaryErr, fallbackErr)
 }
 
+type clientOptions struct {
+	buildEnvironmentProxy   bool
+	requireAccountIsolation bool
+}
+
 func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity, encryptedCredentialCookies string, managedClearance bool, selected domain.Node) (*Lease, bool, error) {
+	return m.leaseForNodeWithOptions(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected, clientOptions{})
+}
+
+func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scope, affinity, encryptedCredentialCookies string, managedClearance bool, selected domain.Node, options clientOptions) (*Lease, bool, error) {
 	credentialCookies := ""
-	if !managedClearance && scope != domain.ScopeBuild && strings.TrimSpace(encryptedCredentialCookies) != "" {
+	if !managedClearance && usesBrowserClearance(scope) && strings.TrimSpace(encryptedCredentialCookies) != "" {
 		decryptedCookies, decryptErr := m.cipher.Decrypt(encryptedCredentialCookies)
 		if decryptErr != nil {
 			return nil, true, decryptErr
@@ -933,7 +1112,7 @@ func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity
 		}
 	}
 	cookies := ""
-	if scope != domain.ScopeBuild {
+	if usesBrowserClearance(scope) {
 		cookies, err = m.cipher.Decrypt(selected.EncryptedCloudflareCookie)
 		if err != nil {
 			// Managed mode can recover a damaged persisted cookie by asking the
@@ -966,7 +1145,14 @@ func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity
 			return nil, false, err
 		}
 	}
-	client, err := m.clientFor(selected.ID, scope, proxyURL, userAgent, cookies, sticky)
+	// Derive identity independently of the current toggle. clientFor applies one
+	// authoritative toggle snapshot, so enabling isolation between these two
+	// stages cannot accidentally place an account request in the shared bucket.
+	accountIdentity := ""
+	if scope != domain.ScopeConsoleAsset {
+		accountIdentity = isolationAccountIdentity(ctx, scope, affinity)
+	}
+	client, err := m.clientForWithOptions(selected.ID, scope, proxyURL, userAgent, cookies, sticky, accountIdentity, options)
 	if err != nil {
 		return nil, false, err
 	}
@@ -978,6 +1164,14 @@ func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity
 			m.decrementInflight(selected.ID)
 		})
 	}}, true, nil
+}
+
+// Console assets are served from public media hosts. They still need the
+// selected proxy and browser user agent, but forwarding account or node
+// clearance cookies would unnecessarily expose credentials to a different
+// origin and make an otherwise anonymous download depend on cookie storage.
+func usesBrowserClearance(scope domain.Scope) bool {
+	return scope != domain.ScopeBuild && scope != domain.ScopeConsoleAsset
 }
 
 func (m *Manager) inflightCounter(nodeID uint64) *atomic.Int64 {
@@ -1127,6 +1321,9 @@ func fallbackScopes(scope domain.Scope) []domain.Scope {
 	if scope == domain.ScopeWebAsset {
 		return []domain.Scope{domain.ScopeWebAsset, domain.ScopeWeb}
 	}
+	if scope == domain.ScopeConsoleAsset {
+		return []domain.Scope{domain.ScopeConsoleAsset, domain.ScopeConsole, domain.ScopeWeb}
+	}
 	if scope == domain.ScopeConsole {
 		// Console uses the same browser/clearance surface as Grok Web. A
 		// dedicated Console node is preferred, but a Web node is a safe and
@@ -1169,7 +1366,11 @@ func (m *Manager) inflightCount(nodeID uint64) int64 {
 	return 0
 }
 
-func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool) (cachedClient, error) {
+func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool, accountIdentity string) (cachedClient, error) {
+	return m.clientForWithOptions(id, scope, proxyURL, userAgent, cookies, sticky, accountIdentity, clientOptions{})
+}
+
+func (m *Manager) clientForWithOptions(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool, accountIdentity string, options clientOptions) (cachedClient, error) {
 	clientKind := "browser"
 	buildHeaderTimeout := time.Duration(0)
 	if scope == domain.ScopeBuild {
@@ -1179,15 +1380,29 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 			buildHeaderTimeout = settingsdomain.DefaultBuildResponseHeaderTimeout
 		}
 		clientKind += "\x00" + strconv.FormatInt(int64(buildHeaderTimeout), 10)
+		if options.buildEnvironmentProxy {
+			clientKind += "\x00environment-proxy"
+		}
 	}
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(clientKind+"\x00"+proxyURL+"\x00"+userAgent+"\x00"+cookies)))
 	cacheScope := scope
 	if cacheScope == domain.ScopeWebAsset {
 		cacheScope = domain.ScopeWeb
 	}
-	key := clientCacheKey{nodeID: id, scope: cacheScope, fingerprint: fingerprint}
-	loadKey := strconv.FormatUint(key.nodeID, 10) + "\x00" + string(key.scope) + "\x00" + key.fingerprint
 	for attempt := 0; attempt < clientCreationRetryLimit; attempt++ {
+		isolated := m.accountIsolated.Load()
+		if options.requireAccountIsolation && !isolated {
+			return cachedClient{}, errAccountConnectionIsolationDisabled
+		}
+		keyAccountIdentity := ""
+		if isolated {
+			keyAccountIdentity = strings.TrimSpace(accountIdentity)
+			if keyAccountIdentity == "" {
+				keyAccountIdentity = "shared"
+			}
+		}
+		key := clientCacheKey{nodeID: id, scope: cacheScope, fingerprint: fingerprint, accountIdentity: keyAccountIdentity}
+		loadKey := strconv.FormatUint(key.nodeID, 10) + "\x00" + string(key.scope) + "\x00" + key.fingerprint + "\x00" + key.accountIdentity
 		now := time.Now().UTC()
 		m.clientMu.RLock()
 		cached, cachedOK := m.clients[key]
@@ -1211,7 +1426,7 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 		closeRequestClients(stale)
 
 		loaded, err, _ := m.clientLoads.Do(loadKey, func() (any, error) {
-			return m.createAndCacheClient(key, id, scope, proxyURL, userAgent, sticky, buildHeaderTimeout)
+			return m.createAndCacheClient(key, id, scope, proxyURL, userAgent, sticky, buildHeaderTimeout, options)
 		})
 		if errors.Is(err, errClientCacheInvalidated) {
 			continue
@@ -1224,10 +1439,15 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 	return cachedClient{}, errClientCacheInvalidated
 }
 
-func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope domain.Scope, proxyURL, userAgent string, sticky bool, buildHeaderTimeout time.Duration) (cachedClient, error) {
+func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope domain.Scope, proxyURL, userAgent string, sticky bool, buildHeaderTimeout time.Duration, options clientOptions) (cachedClient, error) {
 	now := time.Now().UTC()
 	m.clientMu.Lock()
 	stale := m.cleanupClientCacheLocked(now)
+	if (key.accountIdentity != "") != m.accountIsolated.Load() {
+		m.clientMu.Unlock()
+		closeRequestClients(stale)
+		return cachedClient{}, errClientCacheInvalidated
+	}
 	if cached, ok := m.clients[key]; ok {
 		cached.lastUsed = now
 		m.clients[key] = cached
@@ -1239,7 +1459,7 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	m.clientMu.Unlock()
 	closeRequestClients(stale)
 
-	value, err := m.buildCachedClient(scope, proxyURL, userAgent, buildHeaderTimeout)
+	value, err := m.buildCachedClient(scope, proxyURL, userAgent, buildHeaderTimeout, options)
 	if err != nil {
 		return cachedClient{}, err
 	}
@@ -1247,6 +1467,11 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 
 	m.clientMu.Lock()
 	stale = m.cleanupClientCacheLocked(value.lastUsed)
+	if (key.accountIdentity != "") != m.accountIsolated.Load() {
+		m.clientMu.Unlock()
+		closeRequestClients(append(stale, value.client))
+		return cachedClient{}, errClientCacheInvalidated
+	}
 	if cached, ok := m.clients[key]; ok {
 		cached.lastUsed = value.lastUsed
 		m.clients[key] = cached
@@ -1261,9 +1486,14 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	}
 	if id != 0 && !sticky {
 		for previousKey, previous := range m.clients {
-			if previousKey.nodeID == id {
-				stale = append(stale, m.evictClientLocked(previousKey, previous))
+			if previousKey.nodeID != id || previousKey.scope != key.scope {
+				continue
 			}
+			// Keep other accounts' pools when isolation is on.
+			if key.accountIdentity != "" && previousKey.accountIdentity != key.accountIdentity {
+				continue
+			}
+			stale = append(stale, m.evictClientLocked(previousKey, previous))
 		}
 	}
 	stale = append(stale, m.ensureClientCacheCapacityLocked()...)
@@ -1273,8 +1503,19 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	return value, nil
 }
 
-func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent string, buildHeaderTimeout time.Duration) (cachedClient, error) {
+func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent string, buildHeaderTimeout time.Duration, options clientOptions) (cachedClient, error) {
 	if scope == domain.ScopeBuild {
+		if options.buildEnvironmentProxy {
+			factory := m.newBuildEnvClient
+			if factory == nil {
+				factory = newBuildEnvironmentRequestClient
+			}
+			client, err := factory(buildHeaderTimeout)
+			if err != nil {
+				return cachedClient{}, err
+			}
+			return cachedClient{client: client}, nil
+		}
 		factory := m.newBuildClient
 		if factory == nil {
 			factory = newBuildRequestClient
@@ -1298,6 +1539,10 @@ func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent stri
 
 func newBuildRequestClient(proxyURL string, responseHeaderTimeout time.Duration) (requestClient, error) {
 	return newBuildClientWithStreamingTimeout(proxyURL, 0, responseHeaderTimeout)
+}
+
+func newBuildEnvironmentRequestClient(responseHeaderTimeout time.Duration) (requestClient, error) {
+	return newBuildEnvironmentClient(responseHeaderTimeout)
 }
 
 func (m *Manager) cleanupClientCacheLocked(now time.Time) []requestClient {
@@ -1376,6 +1621,13 @@ func (m *Manager) Feedback(ctx context.Context, nodeID uint64, status int, trans
 
 func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, nodeID uint64, status int, transportErr error) {
 	if status == clientClosedRequestStatus || errors.Is(transportErr, context.Canceled) {
+		return
+	}
+	// Console media hosts are public and do not use clearance credentials. A
+	// 403 there commonly describes the object URL (expired, rejected, or
+	// missing), not the proxy's ability to reach the origin, so it must not cool
+	// or rotate an otherwise healthy primary Console node.
+	if scope == domain.ScopeConsoleAsset && transportErr == nil && status == http.StatusForbidden {
 		return
 	}
 	if scope == domain.ScopeBuild && neterrorpkg.IsResponseHeaderTimeout(transportErr) {
@@ -1460,7 +1712,7 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 		cooldown := min(10*time.Minute, 30*time.Second*time.Duration(1<<min(value.FailureCount-1, 4)))
 		until := now.Add(cooldown)
 		value.CooldownUntil = &until
-		value.LastError = "transport error"
+		value.LastError = domain.LastErrorTransport
 		m.clientMu.Lock()
 		stale = m.invalidateClientLocked(nodeID)
 		m.clientMu.Unlock()
@@ -1473,11 +1725,17 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 	if stateRepository, ok := m.repository.(egressStateRepository); ok {
 		if err := stateRepository.UpdateEgressNodeHealth(ctx, value.ID, value.Health, value.FailureCount, value.CooldownUntil, value.LastError); err == nil {
 			m.invalidateNodes(value.Scope)
+			if transportErr != nil {
+				m.scheduleFailureProbe(value)
+			}
 		}
 		return
 	}
 	if _, err := m.repository.UpdateEgressNode(ctx, value); err == nil {
 		m.invalidateNodes(value.Scope)
+		if transportErr != nil {
+			m.scheduleFailureProbe(value)
+		}
 	}
 }
 
@@ -1900,7 +2158,7 @@ func (m *Manager) ForgetClearances(nodeIDs []uint64) {
 	if m.nodeVersions == nil {
 		m.nodeVersions = make(map[domain.Scope]uint64)
 	}
-	for _, scope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+	for _, scope := range allEgressScopes() {
 		m.nodeVersions[scope]++
 	}
 	clear(m.nodes)
@@ -2008,6 +2266,10 @@ func (m *Manager) RefreshDueClearances(ctx context.Context, force bool) error {
 
 func isGrokWebScope(scope domain.Scope) bool {
 	return scope == domain.ScopeWeb || scope == domain.ScopeWebAsset || scope == domain.ScopeConsole
+}
+
+func allEgressScopes() []domain.Scope {
+	return []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset, domain.ScopeConsoleAsset}
 }
 
 func (m *Manager) isStickyProxyNode(value domain.Node) bool {

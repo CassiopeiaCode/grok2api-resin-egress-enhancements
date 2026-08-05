@@ -27,7 +27,7 @@
 > 本项目仅供技术研究与学习交流。使用时请务必遵循 Grok 官方的使用条款及当地法律法规，否则一切后果自负！
 
 > [!IMPORTANT]
-> 本分支增加了 Resin 粘性出口、Grok Build 流式质量观测、自动换 IP、Build/Web/Console 共享代理身份以及响应头超时轮换。实现原理、阈值和安全边界见 [Resin 出口接入与 Grok Build 降智规避](./RESIN_EGRESS_QUALITY.md)。
+> 本分支保留面向 Grok Build 的 Resin 健康粘性租约池。主动准入采用上游 Quality Guard 的固定文本探测，并统一使用 200 Token/s 阈值；生产流式请求提供租约级淘汰信号。旧的 SVG/KNN 分类器与账号 suffix 轮换路径均不再使用。详见 [Resin 健康出口池与 Grok2API Quality Guard 接入](./RESIN_EGRESS_QUALITY.md)。
 
 ## 赞助商
 
@@ -45,6 +45,14 @@
 <tr>
 <td width="200" align="center" valign="middle"><a href="https://www.right.codes/register"><img src="frontend/public/sponner/rightcode.jpg" alt="RightCode" width="160"></a></td>
 <td valign="middle">Right Code 是一个企业级 AI Agent 分发平台，主要提供稳定的 Claude Code、Codex、Gemini 等模型的中转服务。充值即可开票，企业、团队用户一对一对接。感谢 Right Code 提供的 Tokens 支持，点击 <a href="https://www.right.codes/register">此处</a> 注册并开始使用！</td>
+</tr>
+<tr>
+<td width="200" align="center" valign="middle"><a href="https://api.fenno.ai/s/xCBS"><img src="frontend/public/sponner/fenno-ai.jpg" alt="FennoAI" width="160"></a></td>
+<td valign="middle">FennoAI 面向企业研发团队和开发者提供企业级的高稳定、高性能 API 中转服务，兼容 OpenAI 与 Anthropic 协议，可接入 Codex、Claude Code、OpenCode 等主流 AI 编程工具。平台具备企业级稳定性，可支撑千亿 Token/日调用，以及境内外主体公对公结算与开票。Grok2API 用户通过<a href="https://api.fenno.ai/s/xCBS">专属链接</a>购买订阅，仅需 1.99 美元即可获得价值 50 美元的 Coding Plan 额度，邀请好友购买最高可获 20% 返佣。</td>
+</tr>
+<tr>
+<td width="200" align="center" valign="middle"><a href="https://s.qiniu.com/RNNZFf"><img src="frontend/public/sponner/qiniu.jpg" alt="七牛云 AI" width="160"></a></td>
+<td valign="middle">七牛云 AI 是七牛云（02567.HK）旗下企业级大模型 MaaS 平台，可一站式调用全球 150+ 主流模型，兼容主流模型厂商协议，覆盖文本、图像、音频、视频和文件处理等全模态能力，已服务超过 169 万企业及开发者用户。Grok2API 用户通过<a href="https://s.qiniu.com/RNNZFf">专属链接</a>注册，企业用户可免费领取 1200 万 Token，开发者可免费领取 300 万 Token。</td>
 </tr>
 </table>
 
@@ -141,9 +149,9 @@ flowchart LR
 
 | Provider | 认证 | 模型 | 主要能力 |
 | :-- | :-- | :-- | :-- |
-| Grok Build | OAuth / 设备授权 | 按账号动态发现 | Responses、Chat、Messages、compact、stored response、视频 |
-| Grok Web | SSO | 内置并按等级过滤 | Responses、Chat、Messages、图片、图片编辑、视频 |
-| Grok Console | SSO | 内置 | 无状态 Responses、Chat、Messages |
+| Grok Build | OAuth / 设备授权 | 按账号动态发现 | Responses、Chat、Messages、compact、stored response、付费账号视频 |
+| Grok Web | SSO | 内置并按等级过滤 | Responses、Chat、Messages、stored response、图片、图片编辑、视频 |
+| Grok Console | SSO | 内置 | 无状态 Responses、Chat、Messages、图片、图片编辑、视频 |
 
 三个 Provider 独立维护凭据、额度、健康、冷却、并发与模型能力。故障切换不会跨 Provider 混用账号状态。
 
@@ -229,7 +237,52 @@ Web 账号工具支持接受协议、设置对应 20–40 岁的随机生日和�
 
 ## 模型与路由
 
-Build 模型根据账号能力动态发现；Web、Console 使用内置目录。请以模型页面或 `GET /v1/models` 为准，README 不再维护容易过期的静态模型清单。
+Build 模型根据每个账号的实际能力动态发现；Web、Console 使用内置目录。管理端“模型路由”展示 Provider 前缀、接口能力和支持账号数；客户端应以 `GET /v1/models` 返回的当前可服务模型为准。
+
+### Grok Build
+
+Build 不使用全局固定模型清单。账号同步会读取上游 `/models`，不同账号、订阅等级或灰度批次可能返回不同模型，网关按账号能力参与调度，不会用单个账号覆盖全局目录。
+
+| 模型 | 类型 | 可用条件 | 网关接口能力 |
+| :-- | :-- | :-- | :-- |
+| 上游 `/models` 返回的对话模型（例如 `grok-4.5`） | 对话 | 当前账号实际返回 | Chat Completions、Responses、Messages、compact、stored response |
+| `grok-composer-2.5-fast` | 对话 | Grok Build OAuth 账号 | Chat Completions、Responses、Messages；即使上游稀疏目录暂未列出，网关也会按 OAuth 会话能力补齐 |
+| `grok-imagine-video-1.5` | 视频 | Super/付费 Build 账号 | Videos；Free 或能力未知账号不会获得该路由 |
+
+对话请求会转换到 Build Responses 协议，并保留 Codex、Claude Code 所需的工具、推理、多轮与 Prompt Cache 兼容逻辑。Build 当前不提供图片生成和图片编辑路由。
+
+### Grok Web
+
+Web 使用内置目录并按账号等级过滤；更高等级继承低等级模型。
+
+| 模型 | 类型 | 最低等级 | 网关接口能力 |
+| :-- | :-- | :-- | :-- |
+| `grok-chat-fast` | 对话 | Basic | Chat Completions、Responses、Messages |
+| `grok-chat-auto` | 对话 | Super | Chat Completions、Responses、Messages |
+| `grok-chat-expert` | 对话 | Super | Chat Completions、Responses、Messages |
+| `grok-chat-heavy` | 对话 | Heavy | Chat Completions、Responses、Messages |
+| `grok-imagine-image` | 图像 | Basic | Images Generations |
+| `grok-imagine-image-quality` | 图像 | Super | Images Generations |
+| `grok-imagine-image-edit` | 图像编辑 | Super | Images Edits |
+| `grok-imagine-video` | 视频 | Super | Videos |
+
+### Grok Console
+
+Console 使用当前版本内置目录。对话为无状态转发；图片和视频使用 xAI 标准资源接口。
+
+| 模型 | 类型 | 网关接口能力 |
+| :-- | :-- | :-- |
+| `grok-4.20-0309-non-reasoning` | 对话 | Chat Completions、Responses、Messages |
+| `grok-4.20-0309-reasoning` | 对话 | Chat Completions、Responses、Messages；模型会推理，但上游不接受可配置 `reasoningEffort` |
+| `grok-4.20-multi-agent-0309` | 对话 | Chat Completions、Responses、Messages |
+| `grok-4.5` | 对话 | Chat Completions、Responses、Messages |
+| `grok-4.3` | 对话 | Chat Completions、Responses、Messages |
+| `grok-build-0.1` | 对话 | Chat Completions、Responses、Messages |
+| `grok-imagine-image` | 图像、图像编辑 | Images Generations、Images Edits |
+| `grok-imagine-image-quality` | 图像、图像编辑 | Images Generations、Images Edits |
+| `grok-imagine-video` | 视频 | Videos |
+
+同一个 Console 图片模型的生成与编辑能力会聚合展示为一条逻辑模型，不需要创建 `-edit` 模型副本。
 
 公开模型名通常不带 Provider。内部路由使用 `Build/`、`Web/` 或 `Console/` 前缀；带前缀名称可显式限定来源。
 
@@ -286,6 +339,26 @@ curl http://127.0.0.1:8000/v1/responses \
 - 批量探测、筛选、删除、分配与均衡
 - 按作用域配置无回退、直连或固定节点
 - 代理池模式，单次连接失败不会触发全局冷却
+- 固定代理传输失败后立即复测；同节点复测自动合并，后续绑定请求限时等待并在恢复后快速重试
+- 可选的[出口质量守护程序](./tools/egress-quality-guard/README.zh-CN.md)，支持逐节点模型探测、防误杀隔离和自动恢复；通过内置的 `quality-guard` Compose profile 按需启用
+
+首次启用时只需在 `config.yaml` 中增加 `qualityGuard` 并启动 profile。主程序会自动创建并稳定复用不可导出的系统探测身份：
+
+```yaml
+qualityGuard:
+  enabled: true
+  model: "grok-4.5"
+```
+
+```bash
+docker compose --profile quality-guard up -d --build
+```
+
+曾使用预览版 `clientKeyID` 配置的现有部署可以直接升级：该字段会被兼容读取但不再使用，可安全删除；原来手工创建的探测 Key 不会被程序擅自删除。
+
+后续修改该配置时，执行 `docker compose --profile quality-guard restart grok2api egress-quality-guard` 使基础配置重新加载；管理页面中的策略调整仍支持热加载。
+
+普通的 `docker compose up -d` 不会启动守护程序，也不会产生主动探测流量。sidecar 只从主程序获得权限受限的内部凭据，不保存或使用管理员密码。启用自动隔离前请先阅读上面的详细说明。
 
 Resin 用户名支持 `{account}`：
 
@@ -305,6 +378,8 @@ docker compose --profile flaresolverr up -d
 
 出口层只重试可以确认发生在请求提交前的连接故障，不会重放已经提交的生成请求、认证失败、额度耗尽或上游限流。
 
+固定代理进入冷却后会立即触发一次独立连通性复测。同一节点的并发故障只启动一个探针；后续绑定请求最多等待 5 秒，复测健康后重新读取节点状态并继续，不健康则保持原冷却。代理池每次获取新隧道，单个旋转出口失败不会让整个池进入冷却。完整设计与安全边界见[即时故障复测与限时重试](./backend/internal/infra/egress/FAILURE_RETRY.md)。
+
 ## 配置与部署
 
 `config.yaml` 保存启动配置；Provider 和运维参数由管理端维护，未标记“重启生效”的设置支持热加载。
@@ -316,9 +391,18 @@ docker compose --profile flaresolverr up -d
 
 多实例需要为每个副本设置唯一的 `deployment.instanceID`，统一使用同一个 `clusterID`；只有媒体目录已正确共享时才设置 `sharedMedia: true`。
 
+PostgreSQL 凭据可以通过环境变量注入，无需写入 `config.yaml`：
+
+```bash
+GROK2API_DATABASE_URL='postgresql://user:password@host:5432/grok2api?sslmode=require' docker compose up -d
+```
+
+非空的 `GROK2API_DATABASE_URL` 会覆盖 `database.postgres.dsn` 并自动选择 `postgres`；空值不会覆盖 YAML。支持 `postgres://` 和 `postgresql://`，SQLAlchemy 的 `postgresql+asyncpg://` 会返回格式迁移提示。程序不会隐式读取通用的 `DATABASE_URL`；平台只提供该变量时，可在部署清单中显式映射为 `GROK2API_DATABASE_URL: "${DATABASE_URL}"`。数据库配置优先级为：内置默认值 < `config.yaml` < `GROK2API_DATABASE_URL`。当前 CLI 没有数据库覆盖参数。
+
 重要的可选设置：
 
 - `audit.ledgerMode`：`observe` 仅报告账本故障；`enforce` 可暂停新推理以保护计费准确性。
+- `routing.accountIsolatedConnections`：为外部 L4 或按连接哈希的负载均衡器按账号拆分出站 TCP/HTTP 连接池。默认关闭，因为会增加连接数、TLS 握手、内存和文件描述符占用。
 - `routing.segmentedSelectorEnabled`：用于大型账号池，同时保留完整选号回退与原子门禁。
 - Build 响应头超时和精确匹配的 403 失效规则支持热加载。
 - “同步最新版本”可应用已验证的 Grok Build 客户端版本和 User-Agent。

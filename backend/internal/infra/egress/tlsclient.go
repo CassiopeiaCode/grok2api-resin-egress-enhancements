@@ -23,7 +23,9 @@ const browserResponseHeaderTimeout = 10 * time.Second
 
 type browserResponseHeaderTimeoutError struct{}
 
-func (browserResponseHeaderTimeoutError) Error() string   { return "http2: timeout awaiting response headers" }
+func (browserResponseHeaderTimeoutError) Error() string {
+	return "http2: timeout awaiting response headers"
+}
 func (browserResponseHeaderTimeoutError) Timeout() bool   { return true }
 func (browserResponseHeaderTimeoutError) Temporary() bool { return true }
 

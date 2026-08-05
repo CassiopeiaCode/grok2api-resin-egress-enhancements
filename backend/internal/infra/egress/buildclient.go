@@ -17,7 +17,56 @@ import (
 // the official CLI-facing transport. Browser TLS impersonation is reserved for
 // Grok Web, where the browser fingerprint and User-Agent belong together.
 func newBuildClient(proxyURL string, responseHeaderTimeout time.Duration) (*http.Client, error) {
-	transport, err := newBuildTransport(proxyURL, responseHeaderTimeout)
+	return newBuildClientWithOptions(proxyURL, responseHeaderTimeout, false)
+}
+
+// newBuildEnvironmentClient preserves the process-wide Build direct
+// transport's HTTP_PROXY/HTTPS_PROXY behavior while giving the caller an
+// independent connection pool.
+func newBuildEnvironmentClient(responseHeaderTimeout time.Duration) (*http.Client, error) {
+	return newBuildClientWithOptions("", responseHeaderTimeout, true)
+}
+
+// newBuildClientWithStreamingTimeout preserves the configured header deadline
+// for streams while allowing non-streaming Build responses to wait for the
+// upstream headers. Request cancellation and the server request deadline still
+// bound the overall call.
+func newBuildClientWithStreamingTimeout(proxyURL string, nonStreamingTimeout, streamingTimeout time.Duration) (requestClient, error) {
+	streaming, err := newBuildTransportWithOptions(proxyURL, streamingTimeout, false)
+	if err != nil {
+		return nil, err
+	}
+	nonStreaming, err := newBuildTransportWithOptions(proxyURL, nonStreamingTimeout, false)
+	if err != nil {
+		streaming.CloseIdleConnections()
+		return nil, err
+	}
+	return &http.Client{
+		Transport:     &adaptiveBuildTransport{streaming: streaming, nonStreaming: nonStreaming},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}, nil
+}
+
+type adaptiveBuildTransport struct {
+	streaming    *http.Transport
+	nonStreaming *http.Transport
+}
+
+func (t *adaptiveBuildTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	transport := t.nonStreaming
+	if StreamingFromContext(request.Context()) {
+		transport = t.streaming
+	}
+	return transport.RoundTrip(request)
+}
+
+func (t *adaptiveBuildTransport) CloseIdleConnections() {
+	t.streaming.CloseIdleConnections()
+	t.nonStreaming.CloseIdleConnections()
+}
+
+func newBuildClientWithOptions(proxyURL string, responseHeaderTimeout time.Duration, environmentProxy bool) (*http.Client, error) {
+	transport, err := newBuildTransportWithOptions(proxyURL, responseHeaderTimeout, environmentProxy)
 	if err != nil {
 		return nil, err
 	}
@@ -29,47 +78,7 @@ func newBuildClient(proxyURL string, responseHeaderTimeout time.Duration) (*http
 	}, nil
 }
 
-// newBuildClientWithStreamingTimeout keeps the historical short header
-// deadline for streams while allowing non-streaming Build responses to wait
-// indefinitely for upstream headers. The response body remains governed by
-// the caller's request/context and the 90-second stream-silence tracker.
-func newBuildClientWithStreamingTimeout(proxyURL string, nonStreamingTimeout, streamingTimeout time.Duration) (requestClient, error) {
-	streaming, err := newBuildTransport(proxyURL, streamingTimeout)
-	if err != nil {
-		return nil, err
-	}
-	nonStreaming, err := newBuildTransport(proxyURL, nonStreamingTimeout)
-	if err != nil {
-		streaming.CloseIdleConnections()
-		return nil, err
-	}
-	return &http.Client{
-		Transport: &adaptiveBuildTransport{streaming: streaming, nonStreaming: nonStreaming},
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}, nil
-}
-
-type adaptiveBuildTransport struct {
-	streaming    *http.Transport
-	nonStreaming *http.Transport
-}
-
-func (c *adaptiveBuildTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	transport := c.nonStreaming
-	if StreamingFromContext(request.Context()) {
-		transport = c.streaming
-	}
-	return transport.RoundTrip(request)
-}
-
-func (c *adaptiveBuildTransport) CloseIdleConnections() {
-	c.streaming.CloseIdleConnections()
-	c.nonStreaming.CloseIdleConnections()
-}
-
-func newBuildTransport(proxyURL string, responseHeaderTimeout time.Duration) (*http.Transport, error) {
+func newBuildTransportWithOptions(proxyURL string, responseHeaderTimeout time.Duration, environmentProxy bool) (*http.Transport, error) {
 	direct := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
 		Proxy:                 nil,
@@ -82,6 +91,9 @@ func newBuildTransport(proxyURL string, responseHeaderTimeout time.Duration) (*h
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 		ExpectContinueTimeout: time.Second,
+	}
+	if environmentProxy {
+		transport.Proxy = http.ProxyFromEnvironment
 	}
 	if strings.TrimSpace(proxyURL) != "" {
 		parsed, err := url.Parse(proxyURL)

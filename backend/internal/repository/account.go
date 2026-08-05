@@ -68,13 +68,6 @@ type ObservedModelWriter interface {
 	UpdateObservedModelIfNewer(ctx context.Context, id uint64, model string, observedAt time.Time) (bool, error)
 }
 
-// ResinAccountSuffixRepository is optional so lightweight account repositories
-// remain compatible. The relational implementation persists an account-level
-// Resin identity suffix atomically; it never calls a Resin lease API.
-type ResinAccountSuffixRepository interface {
-	RotateResinAccountSuffix(ctx context.Context, id uint64, expectedSuffix, suffix string) (account.Credential, error)
-}
-
 // RoutingLayerRepository separates reusable account state from model overlays.
 type RoutingLayerRepository interface {
 	ListRoutingAccountBases(ctx context.Context, provider account.Provider, quotaMode string) ([]account.RoutingAccountBase, error)

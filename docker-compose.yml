@@ -8,9 +8,13 @@ services:
       - "${GROK2API_PORT:-8000}:8000"
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
+      # 非空时覆盖 config.yaml 的 PostgreSQL DSN，并自动启用 postgres。
+      GROK2API_DATABASE_URL: "${GROK2API_DATABASE_URL:-}"
+      GROK2API_QUALITY_GUARD_DIR: /var/lib/grok2api-quality-guard
     volumes:
       - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"
       - grok2api-data:/app/data
+      - quality_guard_state:/var/lib/grok2api-quality-guard
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
@@ -18,9 +22,7 @@ services:
       - no-new-privileges:true
 
   pelican-egress-guard:
-    build:
-      context: ./pelican-egress-guard
-      dockerfile: Dockerfile.pool
+    image: "${RESIN_HEALTH_POOL_IMAGE:-ghcr.io/cassiopeiacode/grok2api-resin-egress-enhancements/resin-health-pool:latest}"
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
       GUARD_BASE_URL: http://grok2api:8000
@@ -29,7 +31,6 @@ services:
       GUARD_PROXY_HOST: central-resin
       GUARD_PROXY_PORT: "2260"
       GUARD_PROXY_SCHEME: socks5h
-      PELICAN_MODEL_PATH: /app/model/pelican-knn-v1.json
       PELICAN_NODE_ID: "${PELICAN_NODE_ID:-33}"
     volumes:
       - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"
@@ -75,5 +76,28 @@ services:
   #     LOG_LEVEL: info
   #   restart: unless-stopped
 
+  # ================================ EGRESS QUALITY GUARD ================================
+  # 可选的 Grok Build 出口质量守护 sidecar。默认不启动，也不会产生探测请求。
+  # 启用前在 config.yaml 中配置 qualityGuard，然后执行：
+  # docker compose --profile quality-guard up -d --build
+
+  egress-quality-guard:
+    container_name: grok2api-egress-quality-guard
+    profiles: ["quality-guard"]
+    build:
+      context: .
+      dockerfile: tools/egress-quality-guard/Dockerfile
+    depends_on:
+      grok2api:
+        condition: service_healthy
+    volumes:
+      - quality_guard_state:/var/lib/grok2api-quality-guard
+    restart: "on-failure:5"
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   grok2api-data:
+  quality_guard_state:

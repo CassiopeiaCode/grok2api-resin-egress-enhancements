@@ -475,24 +475,35 @@ func TestImageEditAcceptsOfficialJSONShape(t *testing.T) {
 	}
 
 	invalidResolution := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{
-		"model":"grok-imagine-image-edit","prompt":"test","resolution":"2k",
+		"model":"grok-imagine-image-edit","prompt":"test","resolution":"4k",
 		"image":{"url":"https://example.com/input.png"}
 	}`))
 	invalidResolution.Header.Set("Content-Type", "application/json")
 	invalidResolutionRecorder := httptest.NewRecorder()
 	router.ServeHTTP(invalidResolutionRecorder, invalidResolution)
-	if invalidResolutionRecorder.Code != http.StatusBadRequest || !strings.Contains(invalidResolutionRecorder.Body.String(), "仅支持 resolution=1k") {
+	if invalidResolutionRecorder.Code != http.StatusBadRequest || !strings.Contains(invalidResolutionRecorder.Body.String(), "resolution 必须是 1k 或 2k") {
 		t.Fatalf("invalid resolution status=%d body=%s", invalidResolutionRecorder.Code, invalidResolutionRecorder.Body.String())
 	}
 
+	validBatchCount := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{
+		"model":"grok-imagine-image-quality","prompt":"test","n":2,
+		"image":{"url":"https://example.com/input.png"}
+	}`))
+	validBatchCount.Header.Set("Content-Type", "application/json")
+	validBatchRecorder := httptest.NewRecorder()
+	router.ServeHTTP(validBatchRecorder, validBatchCount)
+	if validBatchRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("valid batch count status=%d body=%s", validBatchRecorder.Code, validBatchRecorder.Body.String())
+	}
+
 	invalidCount := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{
-		"model":"grok-imagine-image-edit","prompt":"test","n":2,
+		"model":"grok-imagine-image-quality","prompt":"test","n":11,
 		"image":{"url":"https://example.com/input.png"}
 	}`))
 	invalidCount.Header.Set("Content-Type", "application/json")
 	invalidCountRecorder := httptest.NewRecorder()
 	router.ServeHTTP(invalidCountRecorder, invalidCount)
-	if invalidCountRecorder.Code != http.StatusBadRequest || !strings.Contains(invalidCountRecorder.Body.String(), "仅支持 n=1") {
+	if invalidCountRecorder.Code != http.StatusBadRequest || !strings.Contains(invalidCountRecorder.Body.String(), "n 必须在 1 到 10 之间") {
 		t.Fatalf("invalid count status=%d body=%s", invalidCountRecorder.Code, invalidCountRecorder.Body.String())
 	}
 
@@ -594,8 +605,8 @@ func TestExtractUsageFromCompletedEvent(t *testing.T) {
 }
 
 func TestExtractUsageFromAnthropicMessagesCaches(t *testing.T) {
-	metadata := normalizeMetadataUsage(extractMetadata([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"grok-4.5","usage":{"input_tokens":20,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":80,"cost_in_usd_ticks":1000}}`)), streamProtocolAnthropic)
-	if metadata.Usage.CachedInputTokens != 80 || metadata.Usage.InputTokens != 100 || metadata.Usage.OutputTokens != 20 {
+	metadata := normalizeMetadataUsage(extractMetadata([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"grok-4.5","usage":{"input_tokens":20,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":80,"output_tokens_details":{"thinking_tokens":12},"cost_in_usd_ticks":1000}}`)), streamProtocolAnthropic)
+	if metadata.Usage.CachedInputTokens != 80 || metadata.Usage.InputTokens != 100 || metadata.Usage.OutputTokens != 20 || metadata.Usage.ReasoningTokens != 12 {
 		t.Fatalf("anthropic usage = %#v", metadata.Usage)
 	}
 	if metadata.Usage.TotalTokens != 120 {
@@ -622,11 +633,11 @@ func TestExtractUsagePrefersResponsesCachedTokensOverAnthropicField(t *testing.T
 func TestStreamInspectorMergesCachedTokensAcrossFrames(t *testing.T) {
 	inspector := &responseInspector{protocol: streamProtocolAnthropic}
 	inspector.Inspect([]byte("data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":20,\"output_tokens\":20}}\n\n"))
-	inspector.Inspect([]byte("data: {\"type\":\"message_delta\",\"usage\":{\"cache_read_input_tokens\":80}}\n\n"))
+	inspector.Inspect([]byte("data: {\"type\":\"message_delta\",\"usage\":{\"cache_read_input_tokens\":80,\"output_tokens_details\":{\"thinking_tokens\":12}}}\n\n"))
 	inspector.Inspect([]byte("data: {\"type\":\"message_stop\"}\n\n"))
 	inspector.Finish()
 	usage := inspector.Metadata().Usage
-	if usage.InputTokens != 100 || usage.OutputTokens != 20 || usage.CachedInputTokens != 80 || usage.TotalTokens != 120 {
+	if usage.InputTokens != 100 || usage.OutputTokens != 20 || usage.CachedInputTokens != 80 || usage.ReasoningTokens != 12 || usage.TotalTokens != 120 {
 		t.Fatalf("merged stream usage = %#v", usage)
 	}
 }
@@ -899,11 +910,10 @@ func TestWriteResultTurnsPreHeaderStreamSilenceIntoGatewayError(t *testing.T) {
 	handler := NewHandler(nil, nil, 1<<20)
 	var finalCode string
 	result := &gateway.Result{
-		StatusCode:            http.StatusOK,
-		Status:                "200 OK",
-		Header:                http.Header{"Content-Type": {"text/event-stream"}},
-		Body:                  io.NopCloser(strings.NewReader("")),
-		StreamSilenceTimedOut: func() bool { return true },
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader("")),
 		Finalize: func(_ gateway.Usage, _, code string) {
 			finalCode = code
 		},

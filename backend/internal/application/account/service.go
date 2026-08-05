@@ -2,11 +2,10 @@ package account
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
@@ -86,6 +85,12 @@ const (
 	accountTaskBatchSize                          = 1000
 	buildBotFlagCacheTTL            time.Duration = 30 * time.Second
 	linkedDeleteRuntimeCleanupLimit               = 3 * time.Second
+	// buildDetectModel 管理端「检测账号」固定使用的 Grok Build 模型。
+	buildDetectModel               = "grok-4.5"
+	buildDetectQuotaRecoveryPause  = 24 * time.Hour
+	buildDetectModelDeniedCooldown = 5 * time.Minute
+	// buildDetectPrompt 探测请求正文，仅用于验证凭据与上游可用性。
+	buildDetectPrompt = "hello,test"
 )
 
 const permanentRefreshExpiredReason = "OAuth refresh token 已永久失效且 access token 已过期"
@@ -228,6 +233,31 @@ type ImportedAccountObserver func(accountID uint64) error
 // BatchProgressObserver 在单个账号任务结束后报告批次完成数。
 type BatchProgressObserver func(completed, total int) error
 
+// BuildDetectOutcome 描述单次 Grok Build 可用性探测结果。
+type BuildDetectOutcome string
+
+const (
+	// BuildDetectOutcomeOK 表示探测成功，账号可用。
+	BuildDetectOutcomeOK BuildDetectOutcome = "ok"
+	// BuildDetectOutcomeInvalid 表示已确认失效并标 reauthRequired。
+	BuildDetectOutcomeInvalid BuildDetectOutcome = "invalid"
+	// BuildDetectOutcomeFailed 表示探测失败但未判定为永久失效（网络/5xx/临时额度等）。
+	BuildDetectOutcomeFailed BuildDetectOutcome = "failed"
+)
+
+// BuildDetectItemResult 是单账号探测的结构化结果，供 SSE 增量推送。
+type BuildDetectItemResult struct {
+	AccountID  uint64
+	Name       string
+	Email      string
+	Outcome    BuildDetectOutcome
+	Reason     string
+	HTTPStatus int
+}
+
+// BuildDetectItemObserver 在单个账号探测完成后推送明细；返回错误会取消批次。
+type BuildDetectItemObserver func(item BuildDetectItemResult) error
+
 type ExportResult struct {
 	Data  []byte
 	Count int
@@ -360,9 +390,6 @@ type Service struct {
 	refreshEgress         refreshEgressSelector
 }
 
-// refreshEgressSelector supplies the stable Pelican/Resin identity used for
-// Build OAuth refresh requests. Keeping this as a small interface avoids a
-// dependency from account lifecycle code on the Pelican application package.
 type refreshEgressSelector interface {
 	Select(context.Context, uint64) (string, error)
 }
@@ -401,8 +428,8 @@ func (s *Service) SetConcurrencyLimiter(value repository.ConcurrencyLimiter) {
 	s.concurrency = value
 }
 
-// SetRefreshEgressSelector makes Build credential refreshes use the same
-// active good Pelican lease pool as normal Build requests.
+// SetRefreshEgressSelector makes Build OAuth refreshes use the same active
+// Pelican/Resin good lease pool as ordinary Build requests.
 func (s *Service) SetRefreshEgressSelector(value refreshEgressSelector) {
 	s.refreshEgress = value
 }
@@ -425,8 +452,9 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		},
 		autoCleanWake:     make(chan struct{}, 1),
 		buildBotFlagCache: resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
-		conversionPool:    batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
-		now: func() time.Time { return time.Now().UTC() },
+		conversionPool:    batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), detectPool: batch.NewPool(32),
+		logger: slog.Default(),
+		now:    func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -449,6 +477,13 @@ func (s *Service) SetTaskPools(conversion, syncPool, refresh *batch.Pool) {
 	}
 }
 
+// SetDetectPool 绑定管理端「检测账号」专用并发池；nil 时保留现有池。
+func (s *Service) SetDetectPool(pool *batch.Pool) {
+	if pool != nil {
+		s.detectPool = pool
+	}
+}
+
 func (s *Service) SetLogger(logger *slog.Logger) {
 	if logger != nil {
 		s.logger = logger
@@ -465,10 +500,11 @@ func (s *Service) ProviderDefinition(value accountdomain.Provider) (provider.Def
 
 func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]View, int64, error) {
 	page, pageSize = normalizePage(page, pageSize)
+	egressMode, egressNodeID, egressSourceID, egressValid := parseEgressFilter(filter.Egress)
 	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) ||
 		!oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") ||
 		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") ||
-		!oneOf(filter.Egress, "", "bound", "unbound") ||
+		!egressValid ||
 		!oneOf(filter.Renewal, "", "refreshable", "unrefreshable") ||
 		!oneOf(filter.Risk, "", "flagged", "normal") ||
 		(filter.Risk != "" && filter.Provider != string(accountdomain.ProviderBuild)) ||
@@ -484,7 +520,8 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		refreshable = &value
 	}
 	repositoryFilter := repository.AccountListFilter{
-		Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Egress: filter.Egress,
+		Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Egress: egressMode,
+		EgressNodeID: egressNodeID, EgressSourceID: egressSourceID,
 		Refreshable: refreshable, Agreement: filter.Agreement, Association: filter.Association, Now: s.now(),
 	}
 	if filter.Risk != "" {
@@ -577,6 +614,35 @@ func (s *Service) loadBuildBotFlaggedAccountIDs(ctx context.Context) ([]uint64, 
 func (s *Service) invalidateBuildBotFlagCache() {
 	if s.buildBotFlagCache != nil {
 		s.buildBotFlagCache.Delete(buildBotFlagCacheKey)
+	}
+}
+
+// parseEgressFilter splits the account egress filter into its bound/unbound mode
+// and an optional narrowing target. Accepted values are "", "bound", "unbound",
+// "node:<id>" and "source:<id>"; the last two are "bound" narrowed to one egress
+// node or to every node owned by one subscription source.
+func parseEgressFilter(value string) (mode string, nodeID uint64, sourceID uint64, ok bool) {
+	if oneOf(value, "", "bound", "unbound") {
+		return value, 0, 0, true
+	}
+	prefix, raw, found := strings.Cut(value, ":")
+	if !found {
+		return "", 0, 0, false
+	}
+	// Relational account and egress IDs are stored in signed BIGINT/INTEGER
+	// columns. Reject values outside that range here so malformed filters cannot
+	// reach database/sql as unsupported high-bit uint64 arguments and become 500s.
+	id, err := strconv.ParseUint(raw, 10, 63)
+	if err != nil || id == 0 {
+		return "", 0, 0, false
+	}
+	switch prefix {
+	case "node":
+		return "bound", id, 0, true
+	case "source":
+		return "bound", 0, id, true
+	default:
+		return "", 0, 0, false
 	}
 }
 
@@ -888,21 +954,6 @@ func (s *Service) Get(ctx context.Context, id uint64) (View, error) {
 		return View{}, err
 	}
 	return view, nil
-}
-
-// RotateResinAccountSuffix assigns a new random, non-sensitive sticky
-// identity suffix to one account. It is intentionally separate from OAuth
-// credential state and never contacts Resin's lease API.
-func (s *Service) RotateResinAccountSuffix(ctx context.Context, id uint64, expectedSuffix string) (accountdomain.Credential, error) {
-	suffixRepo, ok := s.accounts.(repository.ResinAccountSuffixRepository)
-	if !ok {
-		return accountdomain.Credential{}, ErrUnsupported
-	}
-	var raw [8]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return accountdomain.Credential{}, fmt.Errorf("生成 Resin 账号后缀: %w", err)
-	}
-	return suffixRepo.RotateResinAccountSuffix(ctx, id, expectedSuffix, hex.EncodeToString(raw[:]))
 }
 
 func (s *Service) credentialMetadata(value accountdomain.Credential) provider.CredentialMetadata {
@@ -2685,7 +2736,14 @@ func (s *Service) RefreshQuotaMode(ctx context.Context, id uint64, mode string) 
 	if !ok {
 		return accountdomain.QuotaWindow{}, fmt.Errorf("Provider usage 响应缺少 %s 额度", mode)
 	}
-	if err := s.reconcileQuotaRecoveryWindow(ctx, refreshed.Credential.Provider, id, window); err != nil {
+	if refreshed.Credential.Provider == accountdomain.ProviderConsole {
+		// One Console request refreshes all three authoritative windows. Reconcile
+		// every matching recovery event so externally consumed media quota cannot
+		// remain unscheduled merely because a different kind triggered the refresh.
+		if err := s.reconcileQuotaRecoveryWindows(ctx, refreshed.Credential.Provider, id, refreshed.Windows); err != nil {
+			return window, err
+		}
+	} else if err := s.reconcileQuotaRecoveryWindow(ctx, refreshed.Credential.Provider, id, window); err != nil {
 		return window, err
 	}
 	return window, nil
@@ -2729,8 +2787,8 @@ func (s *Service) refreshQuotaMode(ctx context.Context, id uint64, mode string) 
 	var tier accountdomain.WebTier
 	if value.Provider == accountdomain.ProviderConsole {
 		// Console /usage always returns Chat, Image and Video together. Persist the
-		// response as one authoritative snapshot so informational media quotas do
-		// not remain stale while only Chat participates in routing and recovery.
+		// response as one authoritative snapshot so each media route observes the
+		// same upstream usage generation.
 		var snapshot provider.QuotaSnapshot
 		snapshot, err = adapter.SyncQuota(ctx, value)
 		if err == nil {
@@ -2778,7 +2836,7 @@ func (s *Service) refreshQuotaMode(ctx context.Context, id uint64, mode string) 
 
 func quotaSyncKey(accountID uint64, mode string) string {
 	mode = strings.TrimSpace(mode)
-	if mode == "console" || mode == "console_image" || mode == "console_video" {
+	if isConsoleUsageQuotaMode(mode) {
 		return "all:" + strconv.FormatUint(accountID, 10)
 	}
 	return mode + ":" + strconv.FormatUint(accountID, 10)
@@ -2830,7 +2888,7 @@ func quotaRecoveryDueAt(window accountdomain.QuotaWindow, now time.Time, exhaust
 		value := *window.ResetAt
 		return &value
 	}
-	if window.Mode == "console" {
+	if isConsoleUsageQuotaMode(window.Mode) {
 		value := now.Add(consolePredictedQuotaProbeDelay)
 		return &value
 	}
@@ -2844,7 +2902,7 @@ func quotaRecoveryDueAt(window accountdomain.QuotaWindow, now time.Time, exhaust
 // QueueQuotaRefresh asynchronously refreshes the remote quota window after a successful request.
 func (s *Service) QueueQuotaRefresh(id uint64, mode string) {
 	mode = strings.TrimSpace(mode)
-	if id == 0 || (mode != "console" && mode != "weekly" && !isWebChatQuotaMode(mode)) {
+	if id == 0 || (!isConsoleUsageQuotaMode(mode) && mode != "weekly" && !isWebChatQuotaMode(mode)) {
 		return
 	}
 	key := strconv.FormatUint(id, 10) + ":" + mode
@@ -3003,11 +3061,12 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 			}
 		}
 		refreshMode := request.mode
+		consoleMode := isConsoleUsageQuotaMode(request.mode)
 		skipUpstream := false
 		if windows, err := s.accounts.GetQuotaWindows(ctx, []uint64{request.accountID}); err == nil {
-			if request.mode == "console" {
+			if consoleMode {
 				for _, window := range windows[request.accountID] {
-					if window.Mode == "console" && window.SyncedAt != nil && s.now().UTC().Sub(window.SyncedAt.UTC()) < consoleQuotaRefreshMinInterval {
+					if window.Mode == request.mode && window.SyncedAt != nil && s.now().UTC().Sub(window.SyncedAt.UTC()) < consoleQuotaRefreshMinInterval {
 						skipUpstream = true
 						break
 					}
@@ -3028,6 +3087,11 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 		var release func()
 		if !skipUpstream && s.refreshLock != nil {
 			effectiveKey := strconv.FormatUint(request.accountID, 10) + ":" + refreshMode
+			if consoleMode {
+				// Every Console mode reads the same /usage snapshot. Serialize all
+				// three kinds across instances to avoid duplicate upstream probes.
+				effectiveKey = "console:" + strconv.FormatUint(request.accountID, 10)
+			}
 			release, acquired, refreshErr = s.refreshLock.Acquire(ctx, "quota-refresh:"+effectiveKey, quotaRefreshTimeout)
 		}
 		if !skipUpstream && refreshErr == nil && acquired {
@@ -3069,7 +3133,7 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 		s.quotaRefreshMu.Unlock()
 		if localChanged || (s.quotaRefreshState != nil && currentShared != sharedGeneration) {
 			perfmetrics.Default.Add("quota_refresh_events", perfmetrics.Labels{Subsystem: "quota", Stage: "refresh", Outcome: "trailing"}, 1)
-			if request.mode == "console" {
+			if consoleMode {
 				s.deferSuccessfulQuotaRefresh(request.key, true)
 				return
 			}
@@ -3083,7 +3147,7 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 				if clearErr != nil {
 					s.logger.Warn("quota_refresh_dirty_clear_failed", "account_id", request.accountID, "mode", request.mode, "error", clearErr)
 				}
-				if request.mode == "console" {
+				if consoleMode {
 					s.deferSuccessfulQuotaRefresh(request.key, true)
 					return
 				}
@@ -3093,7 +3157,7 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 		s.quotaRefreshMu.Lock()
 		state = s.quotaRefreshes[request.key]
 		if state != nil && state.generation == localGeneration {
-			if request.mode == "console" {
+			if consoleMode {
 				state.running = false
 				state.pending = false
 				state.failures = 0
@@ -3105,7 +3169,7 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 			perfmetrics.Default.Add("quota_refresh_events", perfmetrics.Labels{Subsystem: "quota", Stage: "refresh", Outcome: "success"}, 1)
 			return
 		}
-		if request.mode == "console" && state != nil {
+		if consoleMode && state != nil {
 			state.running = false
 			state.pending = true
 			state.failures = 0
@@ -3277,10 +3341,17 @@ func isWebChatQuotaMode(mode string) bool {
 	}
 }
 
+func isConsoleUsageQuotaMode(mode string) bool {
+	switch mode {
+	case "console", "console_image", "console_video":
+		return true
+	default:
+		return false
+	}
+}
+
 func quotaWindowControlsRouting(providerValue accountdomain.Provider, mode string) bool {
-	// Console currently routes text responses only. Its image/video usage
-	// windows are informational and must not quarantine or recover the account.
-	return providerValue != accountdomain.ProviderConsole || mode == "console"
+	return providerValue != accountdomain.ProviderConsole || isConsoleUsageQuotaMode(mode)
 }
 
 // SyncAllBilling 尽力刷新全部启用账号，单个账号失败不阻断其他账号。
@@ -3499,6 +3570,373 @@ func (s *Service) BatchRefreshBilling(ctx context.Context, ids []uint64) (int, i
 		return 0, 0, err
 	}
 	return s.refreshBillings(ctx, values, nil)
+}
+
+// DetectBuildAccountsWithProgress 对指定或全部 Grok Build 账号发起探测请求；all 与 ids 必须且只能提供一个。
+// 该方法同时上报批量进度与单账号明细。
+// itemObserver 在每个账号完成后调用：选中检测会推送全部结果，全量检测仅推送已确认失效账号。
+func (s *Service) DetectBuildAccountsWithProgress(ctx context.Context, ids []uint64, all bool, progress BatchProgressObserver, itemObserver BuildDetectItemObserver) (int, int, error) {
+	if all == (len(ids) > 0) {
+		return 0, 0, invalidInput("必须明确选择全部账号或提供非空账号 ID")
+	}
+	if s.providers == nil {
+		return 0, 0, fmt.Errorf("Provider 注册表未初始化")
+	}
+	selectedMode := !all
+	var err error
+	if all {
+		ids, err = s.accounts.ListEnabledAccountIDs(ctx, accountdomain.ProviderBuild, false)
+		if err != nil {
+			return 0, 0, err
+		}
+	} else {
+		ids, err = normalizeBatchIDs(ids)
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	if len(ids) == 0 {
+		return 0, 0, nil
+	}
+	pool := s.detectPool
+	if pool == nil {
+		pool = s.syncPool
+	}
+	if progress != nil {
+		if err := progress(0, len(ids)); err != nil {
+			return 0, 0, err
+		}
+	}
+	var progressMu sync.Mutex
+	var progressErr error
+	completed := 0
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	summary, err := batch.ForEachObserved(runCtx, ids, batch.Options{Workers: pool.Limit(), Pool: pool}, func(workCtx context.Context, id uint64) (BuildDetectItemResult, error) {
+		item := s.detectBuildAccount(workCtx, id)
+		if itemObserver != nil && (selectedMode || item.Outcome == BuildDetectOutcomeInvalid) {
+			if notifyErr := itemObserver(item); notifyErr != nil {
+				return item, notifyErr
+			}
+		}
+		if item.Outcome == BuildDetectOutcomeOK {
+			return item, nil
+		}
+		if item.Reason != "" {
+			return item, fmt.Errorf("%s", item.Reason)
+		}
+		return item, fmt.Errorf("账号检测失败")
+	}, func(index int, result batch.Result[BuildDetectItemResult]) {
+		var panicErr *batch.PanicError
+		if errors.As(result.Err, &panicErr) {
+			s.logger.Error("account_bulk_task_panicked", "operation", "build_detect", "account_id", ids[index], "error", panicErr, "stack", string(panicErr.Stack))
+		}
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		completed++
+		if progress != nil {
+			if notifyErr := progress(completed, len(ids)); notifyErr != nil && progressErr == nil {
+				progressErr = notifyErr
+				cancel()
+			}
+		}
+	})
+	s.logBatchSummary("build_detect", pool, summary, err)
+	return summary.Succeeded, summary.Failed, errors.Join(err, progressErr)
+}
+
+// detectBuildAccount 使用现有 Build Responses 链路发送固定探测请求。
+// 失效判定复用 provider.ClassifyCredentialRejection：凭据拒绝标 reauthRequired，
+// spending-limit 写额度恢复状态，PermanentAccountDenial 仅阻断固定探测模型。
+func (s *Service) detectBuildAccount(ctx context.Context, id uint64) BuildDetectItemResult {
+	item := BuildDetectItemResult{AccountID: id, Outcome: BuildDetectOutcomeFailed}
+	value, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		item.Reason = mapRepositoryError(err).Error()
+		return item
+	}
+	item.Name = value.Name
+	item.Email = value.Email
+	if value.Provider != accountdomain.ProviderBuild {
+		item.Reason = "仅 Grok Build 账号支持可用性检测"
+		return item
+	}
+	value, err = s.EnsureCredential(ctx, value, false)
+	if err != nil {
+		return s.finishBuildDetectCredentialError(ctx, value, err)
+	}
+	billing, err := s.loadDetectBilling(ctx, id)
+	if err != nil {
+		item.Reason = err.Error()
+		return item
+	}
+	response, err := s.forwardBuildDetect(ctx, value, billing)
+	if err != nil {
+		return s.finishBuildDetectCredentialError(ctx, value, err)
+	}
+	if response.StatusCode == http.StatusUnauthorized {
+		_ = response.Body.Close()
+		return s.handleBuildDetectUnauthorized(ctx, value, billing)
+	}
+	return s.finishBuildDetectResponse(ctx, response, value, billing)
+}
+
+// handleBuildDetectUnauthorized 复用网关对 Build OAuth 401 的恢复与失效收敛路径。
+func (s *Service) handleBuildDetectUnauthorized(ctx context.Context, value accountdomain.Credential, billing *accountdomain.Billing) BuildDetectItemResult {
+	item := BuildDetectItemResult{AccountID: value.ID, Name: value.Name, Email: value.Email, Outcome: BuildDetectOutcomeFailed, HTTPStatus: http.StatusUnauthorized}
+	if value.RefreshPermanent {
+		reason := fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", value.Provider)
+		if markErr := s.markBuildDetectReauth(ctx, value.ID, reason); markErr != nil {
+			item.Reason = markErr.Error()
+			return item
+		}
+		item.Outcome = BuildDetectOutcomeInvalid
+		item.Reason = reason
+		return item
+	}
+	refreshed, refreshErr := s.EnsureCredential(ctx, value, true)
+	if refreshErr != nil {
+		if errors.Is(refreshErr, ErrCredentialRefreshPermanent) {
+			reason := fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", value.Provider)
+			if markErr := s.markBuildDetectReauth(ctx, value.ID, reason); markErr != nil {
+				item.Reason = errors.Join(refreshErr, markErr).Error()
+				return item
+			}
+			item.Outcome = BuildDetectOutcomeInvalid
+			item.Reason = reason
+			return item
+		}
+		return s.finishBuildDetectCredentialError(ctx, value, refreshErr)
+	}
+	response, err := s.forwardBuildDetect(ctx, refreshed, billing)
+	if err != nil {
+		return s.finishBuildDetectCredentialError(ctx, refreshed, err)
+	}
+	if response.StatusCode == http.StatusUnauthorized {
+		drainDetectBody(response.Body)
+		_ = response.Body.Close()
+		reason := "Grok Build OAuth credential rejected after refresh"
+		if markErr := s.markBuildDetectReauth(ctx, refreshed.ID, reason); markErr != nil {
+			item.Reason = markErr.Error()
+			return item
+		}
+		item.AccountID = refreshed.ID
+		item.Name = refreshed.Name
+		item.Email = refreshed.Email
+		item.Outcome = BuildDetectOutcomeInvalid
+		item.Reason = reason
+		return item
+	}
+	return s.finishBuildDetectResponse(ctx, response, refreshed, billing)
+}
+
+func (s *Service) finishBuildDetectCredentialError(ctx context.Context, value accountdomain.Credential, err error) BuildDetectItemResult {
+	item := BuildDetectItemResult{
+		AccountID: value.ID,
+		Name:      value.Name,
+		Email:     value.Email,
+		Outcome:   BuildDetectOutcomeFailed,
+		Reason:    err.Error(),
+	}
+	var refreshErr *provider.CredentialRefreshError
+	if errors.Is(err, ErrCredentialRefreshPermanent) || errors.As(err, &refreshErr) && refreshErr.Permanent {
+		reason := fmt.Sprintf("%s OAuth refresh credential permanently rejected", value.Provider)
+		if markErr := s.markBuildDetectReauth(ctx, value.ID, reason); markErr != nil {
+			item.Reason = errors.Join(err, markErr).Error()
+			return item
+		}
+		item.Outcome = BuildDetectOutcomeInvalid
+		item.Reason = reason
+		return item
+	}
+	if rejection := provider.ClassifyCredentialRejection(0, nil, err); rejection.Rejected {
+		reason := fmt.Sprintf("%s OAuth credential rejected", value.Provider)
+		if markErr := s.markBuildDetectReauth(ctx, value.ID, reason); markErr != nil {
+			item.Reason = errors.Join(err, markErr).Error()
+			return item
+		}
+		item.Outcome = BuildDetectOutcomeInvalid
+		item.Reason = reason
+	}
+	return item
+}
+
+func (s *Service) loadDetectBilling(ctx context.Context, id uint64) (*accountdomain.Billing, error) {
+	snap, err := s.accounts.GetBilling(ctx, id)
+	if err == nil {
+		return &snap, nil
+	}
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, nil
+	}
+	return nil, err
+}
+
+func (s *Service) forwardBuildDetect(ctx context.Context, value accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
+	adapter, ok := s.providers.Responses(accountdomain.ProviderBuild)
+	if !ok {
+		return nil, fmt.Errorf("Provider %s 未注册 Responses 能力", accountdomain.ProviderBuild)
+	}
+	body := []byte(fmt.Sprintf(`{"model":%q,"input":%q}`, buildDetectModel, buildDetectPrompt))
+	return adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{
+		Credential:    value,
+		Billing:       billing,
+		Method:        http.MethodPost,
+		Path:          "/responses",
+		Model:         buildDetectModel,
+		Body:          body,
+		NormalizeBody: true,
+		Streaming:     false,
+	})
+}
+
+// markBuildDetectReauth 与 markSSOCredentialRejected 一样不继承客户端取消，确保已确认失效的账号落库。
+func (s *Service) markBuildDetectReauth(ctx context.Context, id uint64, reason string) error {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
+	defer cancel()
+	if err := s.MarkReauthRequired(writeCtx, id, reason); err != nil {
+		s.logger.Error("account_reauth_required_write_failed", "account_id", id, "provider", accountdomain.ProviderBuild, "error", err)
+		return err
+	}
+	return nil
+}
+
+func (s *Service) finishBuildDetectResponse(ctx context.Context, response *provider.Response, credential accountdomain.Credential, billing *accountdomain.Billing) BuildDetectItemResult {
+	item := BuildDetectItemResult{
+		AccountID:  credential.ID,
+		Name:       credential.Name,
+		Email:      credential.Email,
+		Outcome:    BuildDetectOutcomeFailed,
+		HTTPStatus: response.StatusCode,
+	}
+	if response.Body != nil {
+		defer response.Body.Close()
+	}
+	body := readDetectBodyForClassification(response.Body)
+	rejection := provider.ClassifyCredentialRejection(response.StatusCode, body, nil)
+	if rejection.Rejected {
+		reason := fmt.Sprintf("%s OAuth credential rejected (HTTP %d)", credential.Provider, response.StatusCode)
+		if markErr := s.markBuildDetectReauth(ctx, credential.ID, reason); markErr != nil {
+			item.Reason = markErr.Error()
+			return item
+		}
+		item.Outcome = BuildDetectOutcomeInvalid
+		item.Reason = reason
+		return item
+	}
+	if rejection.SpendingLimitBlocked {
+		reason := fmt.Sprintf("%s spending limit blocked", credential.Provider)
+		if markErr := s.markBuildDetectQuotaExhausted(ctx, credential, billing); markErr != nil {
+			item.Reason = errors.Join(errors.New(reason), markErr).Error()
+			return item
+		}
+		item.Reason = reason
+		return item
+	}
+	if rejection.ModelQuotaExhausted {
+		reason := fmt.Sprintf("%s model quota exhausted for %s", credential.Provider, buildDetectModel)
+		if markErr := s.markBuildDetectModelQuotaExhausted(ctx, credential, reason); markErr != nil {
+			item.Reason = errors.Join(errors.New(reason), markErr).Error()
+			return item
+		}
+		item.Reason = reason
+		return item
+	}
+	if rejection.QuotaExhausted {
+		reason := fmt.Sprintf("%s quota exhausted", credential.Provider)
+		if markErr := s.markBuildDetectQuotaExhausted(ctx, credential, billing); markErr != nil {
+			item.Reason = errors.Join(errors.New(reason), markErr).Error()
+			return item
+		}
+		item.Reason = reason
+		return item
+	}
+	if rejection.PermanentAccountDenial {
+		reason := fmt.Sprintf("%s chat endpoint access denied for %s", credential.Provider, buildDetectModel)
+		if markErr := s.markBuildDetectModelDenied(ctx, credential, reason); markErr != nil {
+			item.Reason = errors.Join(errors.New(reason), markErr).Error()
+			return item
+		}
+		item.Reason = reason
+		return item
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		item.Reason = fmt.Sprintf("上游检测失败: HTTP %d", response.StatusCode)
+		return item
+	}
+	item.Outcome = BuildDetectOutcomeOK
+	item.Reason = ""
+	return item
+}
+
+func (s *Service) markBuildDetectQuotaExhausted(ctx context.Context, credential accountdomain.Credential, billing *accountdomain.Billing) error {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
+	defer cancel()
+	now := s.now()
+	recovery := accountdomain.QuotaRecovery{
+		AccountID: credential.ID, Kind: accountdomain.QuotaRecoveryKindFree, Status: accountdomain.QuotaRecoveryStatusExhausted,
+		ExhaustedAt: &now, LastConfirmedAt: &now, UpdatedAt: now,
+	}
+	nextProbeAt := now.Add(buildDetectQuotaRecoveryPause)
+	if billing != nil && billing.IsPaid() {
+		if periodEnd, ok := billing.PeriodEnd(); ok && periodEnd.After(now) {
+			recovery.Kind = accountdomain.QuotaRecoveryKindPaid
+			nextProbeAt = periodEnd
+		}
+	}
+	recovery.NextProbeAt = &nextProbeAt
+	if err := s.accounts.SaveQuotaRecovery(writeCtx, recovery); err != nil {
+		s.logger.Error("account_quota_recovery_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+		return err
+	}
+	if s.sticky != nil {
+		if err := s.sticky.DeleteByAccount(writeCtx, credential.ID); err != nil {
+			s.logger.Warn("account_sticky_delete_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+		}
+	}
+	return nil
+}
+
+func (s *Service) markBuildDetectModelDenied(ctx context.Context, credential accountdomain.Credential, reason string) error {
+	return s.markBuildDetectModelBlock(ctx, credential, "model_access_denied", buildDetectModelDeniedCooldown, reason)
+}
+
+func (s *Service) markBuildDetectModelQuotaExhausted(ctx context.Context, credential accountdomain.Credential, reason string) error {
+	return s.markBuildDetectModelBlock(ctx, credential, "model_quota_depleted", buildDetectQuotaRecoveryPause, reason)
+}
+
+func (s *Service) markBuildDetectModelBlock(ctx context.Context, credential accountdomain.Credential, blockReason string, cooldown time.Duration, diagnostic string) error {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
+	defer cancel()
+	now := s.now()
+	if err := s.accounts.UpsertModelQuotaBlock(writeCtx, accountdomain.ModelQuotaBlock{
+		AccountID: credential.ID, UpstreamModel: buildDetectModel, Reason: blockReason,
+		CooldownUntil: now.Add(cooldown), UpdatedAt: now,
+	}); err != nil {
+		s.logger.Error("account_model_block_write_failed", "account_id", credential.ID, "provider", credential.Provider, "model", buildDetectModel, "reason", diagnostic, "block_reason", blockReason, "error", err)
+		return err
+	}
+	return nil
+}
+
+// readDetectBodyForClassification 读取响应正文用于凭据拒绝分类，最多 64 KiB。
+// 返回的副本供 ClassifyCredentialRejection 解析；body 读完后会被消耗，调用方不应再使用。
+func readDetectBodyForClassification(body io.ReadCloser) []byte {
+	if body == nil {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(body, 64*1024))
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+func drainDetectBody(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 1<<20))
 }
 
 // BatchResetQuotaState clears local Build quota recovery state without changing

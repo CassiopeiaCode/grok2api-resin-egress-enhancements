@@ -88,7 +88,7 @@ func toAccountDomain(value accountModel) account.Credential {
 		WebNSFWEnabledAt: webNSFWEnabledAt, WebTermsAcceptedAt: webTermsAcceptedAt, WebTermsAcceptedVersion: webTermsAcceptedVersion, WebBirthDateSetAt: webBirthDateSetAt, EgressIdentity: egressIdentity,
 		EgressNodeID: valueEgressNodeID(value.EgressNodeID), EgressAssignmentMode: account.EgressAssignmentMode(value.EgressAssignmentMode), EgressAssignedAt: value.EgressAssignedAt,
 		ResinAccountSuffix: value.ResinAccountSuffix,
-		BuildAPIFallback: value.BuildAPIFallback, BuildRouteMode: buildRouteMode,
+		BuildAPIFallback:   value.BuildAPIFallback, BuildRouteMode: buildRouteMode,
 		BuildSuperEntitled: value.BuildSuperEntitled && account.Provider(value.Provider) == account.ProviderBuild,
 		CreatedAt:          value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
@@ -127,7 +127,7 @@ func fromAccountDomain(value account.Credential) accountModel {
 		BuildAPIFallback: buildAPIFallback, BuildRouteMode: string(buildRouteMode), BuildSuperEntitled: buildSuperEntitled,
 		EgressNodeID: egressNodeID(value.EgressNodeID), EgressAssignmentMode: string(value.EgressAssignmentMode), EgressAssignedAt: value.EgressAssignedAt,
 		ResinAccountSuffix: value.ResinAccountSuffix,
-		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+		CreatedAt:          value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 }
 
@@ -220,9 +220,14 @@ func toModelDomain(value modelRouteModel) model.Route {
 func toClientKeyDomain(value clientKeyModel, allowedModels []uint64) clientkey.Key {
 	providerScope, _ := clientkey.NormalizeProviderScope(clientkey.ProviderScope(value.ProviderScopeMask))
 	tierScope, _ := clientkey.NormalizeTierScope(clientkey.TierScope(value.TierScopeMask))
+	internalKind := ""
+	if value.InternalKind != nil {
+		internalKind = *value.InternalKind
+	}
 	return clientkey.Key{
 		ID: value.ID, Name: value.Name, Prefix: value.Prefix, SecretHash: value.SecretHash, EncryptedSecret: value.EncryptedSecret,
-		Enabled: value.Enabled, ExpiresAt: value.ExpiresAt, RPMLimit: value.RPMLimit, MaxConcurrent: value.MaxConcurrent,
+		InternalKind: internalKind,
+		Enabled:      value.Enabled, ExpiresAt: value.ExpiresAt, RPMLimit: value.RPMLimit, MaxConcurrent: value.MaxConcurrent,
 		BillingLimitUSDTicks: value.BillingLimitUSDTicks, BilledUsageUSDTicks: value.BilledUsageUSDTicks, ReservedUsageUSDTicks: value.ReservedUsageUSDTicks,
 		AllowModelAliases: value.AllowModelAliases, AllowedModels: allowedModels,
 		ProviderScope: providerScope, TierScope: tierScope,

@@ -16,13 +16,54 @@ import (
 )
 
 var (
-	ErrInvalidInput         = errors.New("代理节点参数无效")
-	ErrInvalidFilter        = errors.New("出口代理筛选条件无效")
-	ErrInvalidSort          = errors.New("代理节点排序条件无效")
-	ErrNotFound             = errors.New("代理节点不存在")
-	ErrProbeStale           = errors.New("代理配置在探测期间已更新，请重新测试")
-	ErrClearanceUnavailable = errors.New("Clearance 刷新不可用")
+	ErrInvalidInput            = errors.New("代理节点参数无效")
+	ErrInvalidFilter           = errors.New("出口代理筛选条件无效")
+	ErrInvalidSort             = errors.New("代理节点排序条件无效")
+	ErrNotFound                = errors.New("代理节点不存在")
+	ErrProbeStale              = errors.New("代理配置在探测期间已更新，请重新测试")
+	ErrQualityProbeUnavailable = errors.New("出口质量探测不可用")
+	ErrQualityProbeNoAccount   = errors.New("质量检测暂无可调度账号")
+	ErrClearanceUnavailable    = errors.New("Clearance 刷新不可用")
 )
+
+const (
+	DefaultQualityProbePrompt          = "Reply with exactly QUALITY_OK."
+	DefaultQualityProbeExpected        = "QUALITY_OK"
+	DefaultQualityProbeMaxOutputTokens = 64
+	MaxQualityProbePromptBytes         = 4096
+	MaxQualityProbeExpectedBytes       = 512
+	MaxQualityProbeOutputTokens        = 2048
+)
+
+type QualityProbeInput struct {
+	ClientKeyID     uint64
+	Model           string
+	Prompt          string
+	Expected        string
+	MaxOutputTokens int
+}
+
+type QualityProbeResult struct {
+	RequestID             string
+	NodeID                uint64
+	Model                 string
+	StatusCode            int
+	FirstTokenMS          int64
+	DurationMS            int64
+	GenerationMS          int64
+	ChunkCount            int
+	OutputTokens          int64
+	ReasoningTokens       int64
+	VisibleTokens         int64
+	VisibleCharacters     int
+	OutputTokensPerSecond float64
+	ExpectedMatched       bool
+	ResponseSHA256        string
+}
+
+type QualityProber interface {
+	ProbeEgressQuality(context.Context, uint64, QualityProbeInput) (QualityProbeResult, error)
+}
 
 const (
 	maxProxyURLBytes         = 8192
@@ -67,9 +108,60 @@ type Service struct {
 	clearance         ClearanceManager
 	prober            NodeProber
 	operationsCache   OperationsConfigInvalidator
+	qualityProber     QualityProber
 	assignmentMu      sync.Mutex
 	lastAssignmentRun time.Time
 	assignmentRunning bool
+}
+
+func (s *Service) SetQualityProber(value QualityProber) {
+	s.mu.Lock()
+	s.qualityProber = value
+	s.mu.Unlock()
+}
+
+func (s *Service) ProbeQuality(ctx context.Context, nodeID uint64, input QualityProbeInput) (QualityProbeResult, error) {
+	if nodeID == 0 || input.ClientKeyID == 0 {
+		return QualityProbeResult{}, fmt.Errorf("%w: nodeId 和 clientKeyId 必填", ErrInvalidInput)
+	}
+	input.Model = strings.TrimSpace(input.Model)
+	input.Prompt = strings.TrimSpace(input.Prompt)
+	input.Expected = strings.TrimSpace(input.Expected)
+	if input.Model == "" {
+		return QualityProbeResult{}, fmt.Errorf("%w: model 必填", ErrInvalidInput)
+	}
+	if input.Prompt == "" {
+		input.Prompt = DefaultQualityProbePrompt
+	}
+	if input.Expected == "" {
+		input.Expected = DefaultQualityProbeExpected
+	}
+	if len(input.Prompt) > MaxQualityProbePromptBytes || len(input.Expected) > MaxQualityProbeExpectedBytes {
+		return QualityProbeResult{}, fmt.Errorf("%w: 探测文本过长", ErrInvalidInput)
+	}
+	if input.MaxOutputTokens == 0 {
+		input.MaxOutputTokens = DefaultQualityProbeMaxOutputTokens
+	}
+	if input.MaxOutputTokens < 1 || input.MaxOutputTokens > MaxQualityProbeOutputTokens {
+		return QualityProbeResult{}, fmt.Errorf("%w: maxOutputTokens 必须在 1 到 %d 之间", ErrInvalidInput, MaxQualityProbeOutputTokens)
+	}
+	node, err := s.repository.GetEgressNode(ctx, nodeID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return QualityProbeResult{}, ErrNotFound
+	}
+	if err != nil {
+		return QualityProbeResult{}, err
+	}
+	if node.Scope != domain.ScopeBuild || strings.TrimSpace(node.EncryptedProxyURL) == "" {
+		return QualityProbeResult{}, fmt.Errorf("%w: 质量探测仅支持已配置代理的 grok_build 节点", ErrInvalidInput)
+	}
+	s.mu.RLock()
+	prober := s.qualityProber
+	s.mu.RUnlock()
+	if prober == nil {
+		return QualityProbeResult{}, ErrQualityProbeUnavailable
+	}
+	return prober.ProbeEgressQuality(ctx, nodeID, input)
 }
 
 // AccountBindingRepository is intentionally narrow so existing account
@@ -139,7 +231,7 @@ func (s *Service) DefaultUserAgents() map[string]string {
 	defer s.mu.RUnlock()
 	return map[string]string{
 		string(domain.ScopeBuild): "", string(domain.ScopeWeb): s.browserUA, string(domain.ScopeConsole): s.browserUA,
-		string(domain.ScopeWebAsset): s.browserUA,
+		string(domain.ScopeWebAsset): s.browserUA, string(domain.ScopeConsoleAsset): s.browserUA,
 	}
 }
 
@@ -193,7 +285,11 @@ func (s *Service) publicNodes(values []domain.Node) []domain.PublicNode {
 }
 
 func validListScope(scope domain.Scope) bool {
-	return scope == "" || scope == domain.ScopeBuild || scope == domain.ScopeWeb || scope == domain.ScopeConsole || scope == domain.ScopeWebAsset
+	return scope == "" || scope == domain.ScopeBuild || scope == domain.ScopeWeb || scope == domain.ScopeConsole || scope == domain.ScopeWebAsset || scope == domain.ScopeConsoleAsset
+}
+
+func allServiceScopes() []domain.Scope {
+	return []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset, domain.ScopeConsoleAsset}
 }
 
 func validListValue(value string, allowed ...string) bool {
@@ -260,7 +356,7 @@ func (s *Service) validateFallbackNodeUpdate(ctx context.Context, node domain.No
 }
 
 func (s *Service) validateFallbackNodeUpdateWithConfig(node domain.Node, config domain.OperationsConfig) error {
-	for _, scope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+	for _, scope := range allServiceScopes() {
 		fallback := config.FallbackFor(scope)
 		if fallback.Mode != domain.FallbackModeFixed || fallback.NodeID != node.ID {
 			continue
@@ -281,7 +377,7 @@ func (s *Service) UpdateManyEnabled(ctx context.Context, nodeIDs []uint64, enabl
 	}
 
 	// Disabling a fixed fallback would make the persisted routing policy
-	// invalid. At most four fallback nodes need point lookups, regardless of
+	// invalid. At most five fallback nodes need point lookups, regardless of
 	// the batch size.
 	if !enabled && s.operations != nil {
 		config, err := s.operations.GetEgressOperationsConfig(ctx)
@@ -292,8 +388,8 @@ func (s *Service) UpdateManyEnabled(ctx context.Context, nodeIDs []uint64, enabl
 		for _, id := range ids {
 			selected[id] = struct{}{}
 		}
-		fallbackNodeIDs := make(map[uint64]struct{}, 4)
-		for _, scope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+		fallbackNodeIDs := make(map[uint64]struct{}, len(allServiceScopes()))
+		for _, scope := range allServiceScopes() {
 			fallback := config.FallbackFor(scope)
 			if fallback.Mode == domain.FallbackModeFixed {
 				if _, exists := selected[fallback.NodeID]; exists {
@@ -622,8 +718,8 @@ func (s *Service) applyInput(value domain.Node, input Input, create bool) (domai
 	if name == "" || len(name) > 160 {
 		return domain.Node{}, fmt.Errorf("%w: 名称必须在 1 到 160 个字符之间", ErrInvalidInput)
 	}
-	if input.Scope != domain.ScopeBuild && input.Scope != domain.ScopeWeb && input.Scope != domain.ScopeConsole && input.Scope != domain.ScopeWebAsset {
-		return domain.Node{}, fmt.Errorf("%w: scope 必须是 grok_build、grok_web、grok_console 或 grok_web_asset", ErrInvalidInput)
+	if !validListScope(input.Scope) || input.Scope == "" {
+		return domain.Node{}, fmt.Errorf("%w: scope 必须是 grok_build、grok_web、grok_console、grok_web_asset 或 grok_console_asset", ErrInvalidInput)
 	}
 	value.Name, value.Scope, value.Enabled, value.ProxyPool = name, input.Scope, input.Enabled, proxyPool
 	if input.AccountCapacity != nil {
@@ -664,7 +760,7 @@ func (s *Service) applyInput(value domain.Node, input Input, create bool) (domai
 	if value.ProxyPool && strings.TrimSpace(value.EncryptedProxyURL) == "" {
 		return domain.Node{}, fmt.Errorf("%w: 代理池模式需要配置代理地址", ErrInvalidInput)
 	}
-	if input.Scope == domain.ScopeBuild {
+	if input.Scope == domain.ScopeBuild || input.Scope == domain.ScopeConsoleAsset {
 		value.EncryptedCloudflareCookie = ""
 	} else if input.ClearCookies {
 		value.EncryptedCloudflareCookie = ""
