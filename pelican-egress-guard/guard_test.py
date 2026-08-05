@@ -1,6 +1,7 @@
 import unittest
+from unittest import mock
 
-from guard import extract_usage
+from guard import extract_usage, http_sse
 from pelican_pool_guard import accounts
 
 
@@ -17,6 +18,35 @@ class ExtractUsageTest(unittest.TestCase):
     def test_responses_usage(self):
         events = [{"response": {"usage": {"output_tokens": 64}}}]
         self.assertEqual(extract_usage(events), (64, 0))
+
+    def test_http_sse_reads_chat_events_by_line(self):
+        class Response:
+            headers = {"Content-Type": "text/event-stream"}
+
+            def __init__(self):
+                self.lines = iter([
+                    b'data: {"choices":[{"delta":{"content":"hello"}}]}\n',
+                    b'data: {"usage":{"completion_tokens":42}}\n',
+                    b'data: [DONE]\n',
+                ])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def readline(self, _limit):
+                return next(self.lines, b"")
+
+            def read(self, _limit):
+                raise AssertionError("streaming responses must not use buffered read")
+
+        with mock.patch("guard.urllib.request.urlopen", return_value=Response()):
+            result = http_sse("GET", "/probe", timeout=10)
+        self.assertEqual(result["text_parts"], ["hello"])
+        self.assertIsNotNone(result["first_token_at"])
+        self.assertEqual(extract_usage(result["events"]), (42, 0))
 
 
 class AccountSelectionTest(unittest.TestCase):

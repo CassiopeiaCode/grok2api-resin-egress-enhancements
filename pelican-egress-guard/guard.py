@@ -238,7 +238,6 @@ def http_sse(method: str, path: str, body: Any | None = None, token: str = "", t
     first_token_at: float | None = None
     raw_body = bytearray()
     event_name = ""
-    pending = b""
 
     def consume_line(line: bytes) -> None:
         nonlocal event_name, first_token_at
@@ -302,18 +301,17 @@ def http_sse(method: str, path: str, body: Any | None = None, token: str = "", t
             while True:
                 if time.monotonic() - started > timeout:
                     raise TimeoutError("stream deadline exceeded")
-                chunk = response.read(64 * 1024)
-                if not chunk:
+                # read(n) may wait for n bytes or EOF. Typical SSE responses
+                # are smaller than 64 KiB, which would collapse the entire
+                # stream into one final chunk and destroy first-token timing.
+                # Read one SSE line at a time so timestamps reflect arrival.
+                line = response.readline(64 * 1024)
+                if not line:
                     break
-                raw_body.extend(chunk)
+                raw_body.extend(line)
                 if len(raw_body) > 64 * 1024 * 1024:
                     raise GuardError("stream response too large")
-                pending += chunk
-                while b"\n" in pending:
-                    line, pending = pending.split(b"\n", 1)
-                    consume_line(line)
-            if pending:
-                consume_line(pending)
+                consume_line(line)
     except urllib.error.HTTPError as exc:
         raw = exc.read(16 * 1024)
         raise APIError(exc.code, extract_error_code(raw)) from None
