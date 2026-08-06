@@ -1196,6 +1196,9 @@ attemptLoop:
 					lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
 					break
 				} else {
+					if !input.AdminQualityTest && shouldRotateWebConsoleTimeout(err) {
+						s.rotateWebConsoleResinSuffix(ctx, credential, "timeout")
+					}
 					if neterrorpkg.IsResponseHeaderTimeout(err) && !input.AdminQualityTest && input.Streaming && credential.Provider == accountdomain.ProviderBuild && pelicanUsername != "" {
 						s.observePelicanResponseHeader(ctx, credential, pelicanUsername, true)
 					}
