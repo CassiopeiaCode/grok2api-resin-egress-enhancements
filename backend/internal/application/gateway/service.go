@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -339,6 +340,40 @@ func (s *Service) observePelicanResponseHeader(ctx context.Context, credential a
 	} else if streak > 0 {
 		s.logger.Info("pelican_stream_header_timeout_observed", "account_id", credential.ID, "streak", streak)
 	}
+}
+
+// rotateWebConsoleResinSuffix changes only the account-bound Resin identity
+// for Web/Console failures. Build deliberately stays on the Pelican-selected
+// good-lease path and never rotates through this helper.
+func (s *Service) rotateWebConsoleResinSuffix(ctx context.Context, credential accountdomain.Credential, reason string) {
+	if credential.Provider != accountdomain.ProviderWeb && credential.Provider != accountdomain.ProviderConsole {
+		return
+	}
+	suffix, err := security.NewHexToken(6)
+	if err != nil {
+		s.logger.Warn("resin_suffix_generation_failed", "account_id", credential.ID, "provider", credential.Provider, "reason", reason, "error", err)
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountStateWriteTimeout)
+	defer cancel()
+	rotated, err := s.accounts.RotateResinAccountSuffix(writeCtx, credential.ID, credential.ResinAccountSuffix, suffix)
+	if err != nil {
+		s.logger.Warn("resin_suffix_rotation_failed", "account_id", credential.ID, "provider", credential.Provider, "reason", reason, "error", err)
+		return
+	}
+	s.selector.MarkQuotaStateChanged(rotated.Provider, rotated.ID)
+	s.logger.Info("resin_suffix_rotated", "account_id", credential.ID, "provider", credential.Provider, "reason", reason)
+}
+
+func shouldRotateWebConsoleTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if neterrorpkg.IsResponseHeaderTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
 }
 
 func teamModelRateLimitKey(providerValue accountdomain.Provider, teamFingerprint, upstreamModel string) string {
@@ -1096,6 +1131,9 @@ attemptLoop:
 		if err != nil {
 			lease.Release()
 			lastErr = err
+			if !input.AdminQualityTest && shouldRotateWebConsoleTimeout(err) {
+				s.rotateWebConsoleResinSuffix(ctx, credential, "timeout")
+			}
 			if neterrorpkg.IsResponseHeaderTimeout(err) && !input.AdminQualityTest && input.Streaming && credential.Provider == accountdomain.ProviderBuild && pelicanUsername != "" {
 				s.observePelicanResponseHeader(ctx, credential, pelicanUsername, true)
 			}
@@ -1187,6 +1225,9 @@ attemptLoop:
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			if !input.AdminQualityTest && credential.Provider != accountdomain.ProviderBuild && !isTerminalRequestForbidden(credential.Provider, lastFailure) {
+				s.rotateWebConsoleResinSuffix(ctx, credential, "403")
+			}
 			if isTerminalRequestForbidden(credential.Provider, lastFailure) {
 				// Deterministic request-scoped 403: restore the original body and return it
 				// without OAuth refresh, account rotation, cooldown, or invalidation.
@@ -1228,6 +1269,9 @@ attemptLoop:
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			if !input.AdminQualityTest && response.StatusCode == http.StatusTooManyRequests && credential.Provider != accountdomain.ProviderBuild {
+				s.rotateWebConsoleResinSuffix(ctx, credential, "429")
+			}
 			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit == nil {
 				if metadata := provider.ParseRateLimitMetadata(body); metadata != nil {
 					response.RateLimit = metadata

@@ -458,6 +458,13 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 	}
 }
 
+// RotateResinAccountSuffix changes only the non-sensitive sticky-proxy suffix.
+// The repository updates the complete linked account family atomically so Web,
+// Console, and any linked Build projection do not split their Resin identity.
+func (s *Service) RotateResinAccountSuffix(ctx context.Context, accountID uint64, expectedSuffix, suffix string) (accountdomain.Credential, error) {
+	return s.accounts.RotateResinAccountSuffix(ctx, accountID, expectedSuffix, suffix)
+}
+
 func (s *Service) SetBulkPool(pool *batch.Pool) {
 	if pool != nil {
 		s.conversionPool, s.syncPool, s.refreshPool = pool, pool, pool
