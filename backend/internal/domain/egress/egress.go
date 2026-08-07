@@ -2,6 +2,18 @@ package egress
 
 import "time"
 
+const BrowserProxyAccountPoolSize = 20
+
+// BrowserProxyAccount is one persisted Resin identity shared by Web and
+// Console credentials. Slot is stable; replacing an unhealthy identity in a
+// slot moves every credential mapped to that slot at once.
+type BrowserProxyAccount struct {
+	Slot         int
+	ProxyAccount string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
 type Mode string
 
 const (

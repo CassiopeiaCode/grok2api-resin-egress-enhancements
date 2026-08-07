@@ -14,6 +14,15 @@ type EgressRepository interface {
 	DeleteEgressNode(ctx context.Context, id uint64) error
 }
 
+// BrowserProxyAccountRepository is optional so lightweight egress repository
+// implementations and tests can retain the legacy direct identity behavior.
+// The relational runtime implements it to provide the persistent Web/Console
+// anti-timeout pool.
+type BrowserProxyAccountRepository interface {
+	EnsureBrowserProxyAccountPool(ctx context.Context, candidates []string, size int) ([]egress.BrowserProxyAccount, error)
+	ReplaceBrowserProxyAccount(ctx context.Context, slot int, expected, replacement string) (bool, error)
+}
+
 // EgressNodePageRepository is the bounded management-list contract. Runtime
 // routing repositories only need EgressRepository's full-list operations.
 type EgressNodePageRepository interface {

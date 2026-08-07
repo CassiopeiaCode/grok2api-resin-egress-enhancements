@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -363,17 +362,6 @@ func (s *Service) rotateWebConsoleResinSuffix(ctx context.Context, credential ac
 	}
 	s.selector.MarkQuotaStateChanged(rotated.Provider, rotated.ID)
 	s.logger.Info("resin_suffix_rotated", "account_id", credential.ID, "provider", credential.Provider, "reason", reason)
-}
-
-func shouldRotateWebConsoleTimeout(err error) bool {
-	if err == nil {
-		return false
-	}
-	if neterrorpkg.IsResponseHeaderTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	var networkError net.Error
-	return errors.As(err, &networkError) && networkError.Timeout()
 }
 
 func teamModelRateLimitKey(providerValue accountdomain.Provider, teamFingerprint, upstreamModel string) string {
@@ -1131,9 +1119,6 @@ attemptLoop:
 		if err != nil {
 			lease.Release()
 			lastErr = err
-			if !input.AdminQualityTest && shouldRotateWebConsoleTimeout(err) {
-				s.rotateWebConsoleResinSuffix(ctx, credential, "timeout")
-			}
 			if neterrorpkg.IsResponseHeaderTimeout(err) && !input.AdminQualityTest && input.Streaming && credential.Provider == accountdomain.ProviderBuild && pelicanUsername != "" {
 				s.observePelicanResponseHeader(ctx, credential, pelicanUsername, true)
 			}
@@ -1196,9 +1181,6 @@ attemptLoop:
 					lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
 					break
 				} else {
-					if !input.AdminQualityTest && shouldRotateWebConsoleTimeout(err) {
-						s.rotateWebConsoleResinSuffix(ctx, credential, "timeout")
-					}
 					if neterrorpkg.IsResponseHeaderTimeout(err) && !input.AdminQualityTest && input.Streaming && credential.Provider == accountdomain.ProviderBuild && pelicanUsername != "" {
 						s.observePelicanResponseHeader(ctx, credential, pelicanUsername, true)
 					}

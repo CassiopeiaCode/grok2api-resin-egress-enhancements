@@ -42,6 +42,42 @@ func TestBuildProxyPoolLeaseForcesFreshTunnel(t *testing.T) {
 	}
 }
 
+func TestBrowserLeaseDiscardsPoolAccountOnceOnResponseHeaderTimeout(t *testing.T) {
+	client := &scriptedRequestClient{do: func(_ int, _ *http.Request) (*http.Response, error) {
+		return nil, responseHeaderTimeoutError{}
+	}}
+	discarded := 0
+	lease := &Lease{client: client, Scope: egressdomain.ScopeWeb, proxyPool: true, onHeaderTimeout: func() { discarded++ }}
+	for range 2 {
+		request, err := http.NewRequest(http.MethodPost, "https://example.com/generate", bytes.NewReader([]byte("payload")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := lease.Do(request); err == nil {
+			t.Fatal("expected response-header timeout")
+		}
+	}
+	if discarded != 1 {
+		t.Fatalf("discard callbacks = %d, want 1", discarded)
+	}
+}
+
+func TestBrowserLeaseDoesNotDiscardPoolAccountOnOtherFailure(t *testing.T) {
+	client := &scriptedRequestClient{do: func(_ int, _ *http.Request) (*http.Response, error) {
+		return nil, errors.New("upstream reset")
+	}}
+	discarded := 0
+	lease := &Lease{client: client, Scope: egressdomain.ScopeConsole, onHeaderTimeout: func() { discarded++ }}
+	request, err := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = lease.Do(request)
+	if discarded != 0 {
+		t.Fatalf("discard callbacks = %d, want 0", discarded)
+	}
+}
+
 func TestFixedBuildWebAndAccountBoundProxyKeepConnectionReuse(t *testing.T) {
 	for _, test := range []struct {
 		name        string

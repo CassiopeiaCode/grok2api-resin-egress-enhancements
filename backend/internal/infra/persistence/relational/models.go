@@ -91,6 +91,15 @@ type pelicanBadEgressModel struct {
 	UpdatedAt     time.Time `gorm:"not null"`
 }
 
+type browserProxyAccountModel struct {
+	Slot         int       `gorm:"primaryKey;autoIncrement:false;check:chk_browser_proxy_account_slot,slot >= 0 AND slot < 20"`
+	ProxyAccount string    `gorm:"size:128;uniqueIndex;not null;check:chk_browser_proxy_account,length(trim(proxy_account)) BETWEEN 1 AND 128"`
+	CreatedAt    time.Time `gorm:"not null"`
+	UpdatedAt    time.Time `gorm:"not null"`
+}
+
+func (browserProxyAccountModel) TableName() string { return "browser_proxy_accounts" }
+
 func (pelicanBadEgressModel) TableName() string { return "pelican_bad_egresses" }
 
 func (accountModel) TableName() string { return "provider_accounts" }

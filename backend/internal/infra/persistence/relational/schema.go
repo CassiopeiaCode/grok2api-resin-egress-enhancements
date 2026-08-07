@@ -51,6 +51,7 @@ var schemaModels = []any{
 	&runtimeSettingsModel{},
 	&pelicanEgressEntryModel{},
 	&pelicanBadEgressModel{},
+	&browserProxyAccountModel{},
 }
 
 var schemaIndexes = []string{
@@ -107,6 +108,7 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_result_asset ON media_jobs(result_asset_id) WHERE result_asset_id <> ''",
 	"CREATE INDEX IF NOT EXISTS idx_pelican_entries_active_due ON pelican_egress_entries(status, next_check_at, id)",
 	"CREATE INDEX IF NOT EXISTS idx_pelican_bad_expires ON pelican_bad_egresses(expires_at, id)",
+	"CREATE UNIQUE INDEX IF NOT EXISTS idx_browser_proxy_accounts_proxy_account ON browser_proxy_accounts(proxy_account)",
 	// Blacklist identity is the traced public IP, never the Resin username.
 	// Remove the pre-IP username uniqueness constraint left by the first
 	// migration and collapse any duplicate rows before creating the IP key.

@@ -62,20 +62,22 @@ var errClientCacheInvalidated = errors.New("egress client cache invalidated")
 var errAccountConnectionIsolationDisabled = errors.New("egress account connection isolation disabled")
 
 type Lease struct {
-	NodeID           uint64
-	NodeName         string
-	Scope            domain.Scope
-	ProxyURL         string
-	UserAgent        string
-	CFCookies        string
-	client           requestClient
-	browser          *browserClient
-	sticky           bool
-	proxyPool        bool
-	freshTunnel      bool
-	clearanceKey     string
-	clearanceManager *Manager
-	release          func()
+	NodeID            uint64
+	NodeName          string
+	Scope             domain.Scope
+	ProxyURL          string
+	UserAgent         string
+	CFCookies         string
+	client            requestClient
+	browser           *browserClient
+	sticky            bool
+	proxyPool         bool
+	freshTunnel       bool
+	clearanceKey      string
+	clearanceManager  *Manager
+	headerTimeoutOnce sync.Once
+	onHeaderTimeout   func()
+	release           func()
 }
 
 type requestClient interface {
@@ -114,11 +116,21 @@ func (l *Lease) doRequest(request *http.Request, invalidateForbidden bool) (*htt
 		request.Close = true
 	}
 	response, err := l.do(request)
+	if neterrorpkg.IsResponseHeaderTimeout(err) {
+		l.discardTimedOutProxyAccount()
+	}
 	recordPhysicalCall(request.Context(), response, err)
 	if invalidateForbidden && err == nil && response != nil && response.StatusCode == http.StatusForbidden {
 		l.InvalidateClearance()
 	}
 	return response, err
+}
+
+func (l *Lease) discardTimedOutProxyAccount() {
+	if l == nil || l.onHeaderTimeout == nil {
+		return
+	}
+	l.headerTimeoutOnce.Do(l.onHeaderTimeout)
 }
 
 // InvalidateClearance invalidates the exact browser-session binding used by
@@ -474,6 +486,17 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 			identity += "_" + suffix
 		}
 	}
+	var poolMember *domain.BrowserProxyAccount
+	if forcedIdentity == "" && isBrowserCredentialScope(scope) {
+		member, poolErr := m.selectBrowserProxyAccount(ctx, identity)
+		if poolErr != nil {
+			return nil, poolErr
+		}
+		if member.ProxyAccount != "" {
+			poolMember = &member
+			identity = member.ProxyAccount
+		}
+	}
 	ctx = WithAccountIdentity(ctx, identity)
 	nodeID := credential.EgressNodeID
 	if forcedNode := egressNodeFromContext(ctx); forcedNode != 0 {
@@ -481,7 +504,90 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 	}
 	ctx = WithEgressNode(ctx, nodeID)
 	lease, _, err := m.acquire(ctx, scope, strconv.FormatUint(credential.ID, 10), true, credential.EncryptedCloudflareCookie, nodeID)
+	if err == nil && lease != nil && lease.sticky && poolMember != nil {
+		member := *poolMember
+		lease.onHeaderTimeout = func() { m.replaceTimedOutBrowserProxyAccount(member) }
+	}
 	return lease, err
+}
+
+func isBrowserCredentialScope(scope domain.Scope) bool {
+	switch scope {
+	case domain.ScopeWeb, domain.ScopeWebAsset, domain.ScopeConsole, domain.ScopeConsoleAsset:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) selectBrowserProxyAccount(ctx context.Context, identity string) (domain.BrowserProxyAccount, error) {
+	members, err := m.ensureBrowserProxyAccountPool(ctx)
+	if err != nil || len(members) == 0 {
+		return domain.BrowserProxyAccount{}, err
+	}
+	digest := sha256.Sum256([]byte(strings.TrimSpace(identity)))
+	index := int(binary.BigEndian.Uint64(digest[:8]) % uint64(len(members)))
+	return members[index], nil
+}
+
+// InitializeBrowserProxyAccountPool makes the persistent 20-slot pool a
+// startup invariant instead of waiting for the first browser request.
+func (m *Manager) InitializeBrowserProxyAccountPool(ctx context.Context) error {
+	members, err := m.ensureBrowserProxyAccountPool(ctx)
+	if err != nil {
+		return err
+	}
+	if _, supported := m.repository.(repository.BrowserProxyAccountRepository); supported && len(members) != domain.BrowserProxyAccountPoolSize {
+		return fmt.Errorf("Web/Console 代理账号池不完整: %d/%d", len(members), domain.BrowserProxyAccountPoolSize)
+	}
+	return nil
+}
+
+func (m *Manager) ensureBrowserProxyAccountPool(ctx context.Context) ([]domain.BrowserProxyAccount, error) {
+	repo, ok := m.repository.(repository.BrowserProxyAccountRepository)
+	if !ok {
+		return nil, nil
+	}
+	seed, err := security.NewHexToken(16)
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]string, domain.BrowserProxyAccountPoolSize)
+	for slot := range candidates {
+		digest := sha256.Sum256([]byte(seed + ":" + strconv.Itoa(slot)))
+		candidates[slot] = "wc_" + fmt.Sprintf("%x", digest[:12])
+	}
+	members, err := repo.EnsureBrowserProxyAccountPool(ctx, candidates, domain.BrowserProxyAccountPoolSize)
+	if err != nil {
+		return nil, err
+	}
+	if len(members) != domain.BrowserProxyAccountPoolSize {
+		return nil, fmt.Errorf("Web/Console 代理账号池不完整: %d/%d", len(members), domain.BrowserProxyAccountPoolSize)
+	}
+	return members, nil
+}
+
+func (m *Manager) replaceTimedOutBrowserProxyAccount(member domain.BrowserProxyAccount) {
+	repo, ok := m.repository.(repository.BrowserProxyAccountRepository)
+	if !ok || member.ProxyAccount == "" {
+		return
+	}
+	replacement, err := security.NewHexToken(16)
+	if err != nil {
+		m.log().Warn("browser_proxy_account_replacement_generation_failed", "slot", member.Slot, "error", err)
+		return
+	}
+	replacement = "wc_" + replacement
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	replaced, err := repo.ReplaceBrowserProxyAccount(ctx, member.Slot, member.ProxyAccount, replacement)
+	if err != nil {
+		m.log().Warn("browser_proxy_account_replacement_failed", "slot", member.Slot, "error", err)
+		return
+	}
+	if replaced {
+		m.log().Info("browser_proxy_account_replaced", "slot", member.Slot, "reason", "response_header_timeout")
+	}
 }
 
 func (m *Manager) AcquireIfConfigured(ctx context.Context, scope domain.Scope, affinity string) (*Lease, bool, error) {

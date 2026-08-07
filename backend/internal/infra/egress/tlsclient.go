@@ -15,6 +15,7 @@ import (
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/bogdanfinn/websocket"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
 type browserClient struct{ inner tlsclient.HttpClient }
@@ -43,6 +44,9 @@ func (l *Lease) DialWebSocket(ctx context.Context, endpoint string, headers fhtt
 		}
 		connection, response, err := dialer.DialContext(ctx, endpoint, headers)
 		if err == nil || !l.proxyPool || attempt >= proxyPoolRetryLimit || !safeProxyConnectionFailure(err, fhttpResponseAsHTTP(response)) {
+			if neterrorpkg.IsResponseHeaderTimeout(err) {
+				l.discardTimedOutProxyAccount()
+			}
 			if l.proxyPool && safeProxyConnectionFailure(err, fhttpResponseAsHTTP(response)) {
 				l.browser.CloseIdleConnections()
 			}

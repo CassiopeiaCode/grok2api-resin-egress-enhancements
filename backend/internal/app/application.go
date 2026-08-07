@@ -204,6 +204,13 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 
 	egressManager := infraegress.NewManager(egressRepo, cipher)
 	egressManager.SetLogger(logger)
+	if err := egressManager.InitializeBrowserProxyAccountPool(ctx); err != nil {
+		if runtimeStore != nil {
+			_ = runtimeStore.Close()
+		}
+		database.Close()
+		return nil, fmt.Errorf("初始化 Web/Console 代理账号池: %w", err)
+	}
 	egressManager.SetClearanceLock(refreshLock)
 	egressManager.UpdateClearanceConfig(clearanceConfig(cfg))
 	egressManager.UpdateBuildResponseHeaderTimeout(cfg.Provider.Build.ResponseHeaderTimeout.Value())
